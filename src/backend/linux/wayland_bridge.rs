@@ -429,6 +429,8 @@ impl BridgeState {
             active.reporter.finish(Outcome::Failed(SessionFailure {
                 stage: FailureStage::Transfer,
                 kind: FailureKind::NativeFailure,
+                native_code: None,
+                native_effect: None,
             }));
         }
     }

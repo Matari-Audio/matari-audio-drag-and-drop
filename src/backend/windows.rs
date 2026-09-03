@@ -32,7 +32,7 @@ use windows::Win32::UI::Controls::{
 use windows::Win32::UI::Shell::{
     CFSTR_FILENAMEW, CFSTR_PREFERREDDROPEFFECT, DROPFILES, SHCreateStdEnumFmtEtc,
 };
-use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, GetDesktopWindow};
+use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
 use windows::core::implement;
 use windows_core::{BOOL, HRESULT, IUnknown, PCWSTR, Ref, Result};
 
@@ -111,6 +111,8 @@ pub(super) fn start_external_file_drag(
                 Outcome::Failed(SessionFailure {
                     stage: FailureStage::Transfer,
                     kind: FailureKind::NativeRejected,
+                    native_code: Some(result.0),
+                    native_effect: Some(effect.0),
                 })
             };
             reporter.finish(outcome);
@@ -131,7 +133,7 @@ impl Drop for DragBitmapGuard {
     }
 }
 
-struct SourceDragImage(HIMAGELIST, HWND);
+struct SourceDragImage(HIMAGELIST);
 
 impl SourceDragImage {
     fn new(preview: &DragPreview) -> std::result::Result<Self, PreviewAttachError> {
@@ -150,46 +152,32 @@ impl SourceDragImage {
                 0,
             )
         };
-        if list.is_invalid() {
+        if list.is_invalid() || unsafe { ImageList_Add(list, bitmap.0, None) } < 0 {
+            if !list.is_invalid() {
+                let _ = unsafe { ImageList_Destroy(Some(list)) };
+            }
             return Err(PreviewAttachError::new(PreviewFailureStage::Helper, None));
         }
-        // SAFETY: Both the image list and bitmap are live; the list copies the bitmap.
-        if unsafe { ImageList_Add(list, bitmap.0, None) } < 0 {
-            // SAFETY: This branch still uniquely owns the live image list.
-            let _ = unsafe { ImageList_Destroy(Some(list)) };
-            return Err(PreviewAttachError::new(PreviewFailureStage::Helper, None));
-        }
-        // SAFETY: The list contains image zero and the hotspot is within its bounds.
-        if !unsafe {
-            ImageList_BeginDrag(
-                list,
-                0,
-                crate::preview::WIDTH as i32 / 2,
-                crate::preview::HEIGHT as i32 / 2,
-            )
-        }
-        .as_bool()
+        // Hotspot matches the source chip cursor offset so the native image
+        // appears where the in-app drag ghost was, instead of jumping the
+        // image center onto the cursor at handoff.
+        const HOTSPOT_X: i32 = 20;
+        const HOTSPOT_Y: i32 = 22;
+        if !unsafe { ImageList_BeginDrag(list, 0, HOTSPOT_X, HOTSPOT_Y) }.as_bool()
         {
-            // SAFETY: BeginDrag failed, so this branch still uniquely owns the list.
             let _ = unsafe { ImageList_Destroy(Some(list)) };
             return Err(PreviewAttachError::new(PreviewFailureStage::Attach, None));
         }
         let mut cursor = POINT::default();
-        // SAFETY: The desktop window is process-independent and remains valid
-        // for the synchronous drag operation.
-        let lock_window = unsafe { GetDesktopWindow() };
-        // SAFETY: The drag image is active, the cursor pointer is writable,
-        // and Win32 requires a real owner for stable drawing and coordinates.
         unsafe {
             let _ = GetCursorPos(&mut cursor);
-            let _ = ImageList_DragEnter(lock_window, cursor.x, cursor.y);
+            let _ = ImageList_DragEnter(HWND::default(), cursor.x, cursor.y);
         }
-        Ok(Self(list, lock_window))
+        Ok(Self(list))
     }
 
     fn move_to_cursor(&self) {
         let mut cursor = POINT::default();
-        // SAFETY: The drag image is active and `cursor` is writable.
         unsafe {
             if GetCursorPos(&mut cursor).is_ok() {
                 let _ = ImageList_DragMove(cursor.x, cursor.y);
@@ -200,10 +188,8 @@ impl SourceDragImage {
 
 impl Drop for SourceDragImage {
     fn drop(&mut self) {
-        // SAFETY: This ends the active drag image on the same owning window
-        // before destroying its uniquely owned image list.
         unsafe {
-            let _ = ImageList_DragLeave(self.1);
+            let _ = ImageList_DragLeave(HWND::default());
             ImageList_EndDrag();
             let _ = ImageList_Destroy(Some(self.0));
         }
@@ -400,12 +386,9 @@ impl IDataObject_Impl for FileDataObject_Impl {
             Some(ShellDragFormat::Hdrop) => self.hdrop_medium(),
             Some(ShellDragFormat::PreferredDropEffect(_)) => self.preferred_drop_effect_medium(),
             Some(ShellDragFormat::FileNameW(_)) => self.filenamew_medium(),
-            None => {
-                // SAFETY: COM requires this pointer to be null or readable for the call.
-                unsafe { pformatetcin.as_ref() }
-                    .ok_or_else(|| windows_core::Error::from(DV_E_FORMATETC))
-                    .and_then(|format| self.stored_medium(format))
-            }
+            None => unsafe { pformatetcin.as_ref() }
+                .ok_or_else(|| windows_core::Error::from(DV_E_FORMATETC))
+                .and_then(|format| self.stored_medium(format)),
         }
     }
 
@@ -423,7 +406,6 @@ impl IDataObject_Impl for FileDataObject_Impl {
                 .iter()
                 .any(|stored| stored.matches(format))
         });
-        // SAFETY: COM requires this pointer to be null or readable for the call.
         if unsafe { self.requested_format(pformatetc) }.is_some() || stored {
             HRESULT(0)
         } else {
@@ -577,8 +559,6 @@ impl StoredMedium {
 
     fn duplicate_medium(&self) -> Result<STGMEDIUM> {
         Self::duplicate(&self.format, &self.medium).map(|copy| {
-            // SAFETY: `copy` owns this initialized medium; it is forgotten below
-            // so ownership transfers to the returned value exactly once.
             let medium = unsafe { ptr::read(&copy.medium) };
             std::mem::forget(copy);
             medium
