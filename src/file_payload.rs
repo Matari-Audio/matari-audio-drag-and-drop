@@ -178,9 +178,8 @@ mod tests {
 
     #[test]
     fn file_offers_include_uri_and_plain_payloads() {
-        let payload = FileDragPayloadData::from_validated(vec![PathBuf::from(
-            "/tmp/plugin take.flac",
-        )]);
+        let payload =
+            FileDragPayloadData::from_validated(vec![PathBuf::from("/tmp/plugin take.flac")]);
 
         let offers = payload.offers();
 

@@ -8,6 +8,7 @@ use x11rb::protocol::xproto::{
 };
 use x11rb::wrapper::ConnectionExt as _;
 
+use super::outbound::{evaluate_router_message, live_outbound_drag};
 use super::{X11SessionError, X11WaylandBridge, XDND_VERSION, atom, x11_error, x11_wayland_bridge};
 
 struct RouterAtoms {
@@ -160,6 +161,19 @@ impl X11DropRouter {
             return Ok(());
         }
         let data = event.data.as_data32();
+        if event.type_ == self.atoms.xdnd_enter
+            || event.type_ == self.atoms.xdnd_position
+            || event.type_ == self.atoms.xdnd_drop
+        {
+            // `data[0]` is the XDND source window. Hyprland's XWM bridges our
+            // own outbound drag back into X through the proxy we installed, so
+            // without this the router hands the editor its own export and the
+            // resulting rejection cancels the outbound session.
+            if evaluate_router_message(live_outbound_drag(), data[0]).is_suppressed() {
+                self.abandon_route(conn)?;
+                return Ok(());
+            }
+        }
         if event.type_ == self.atoms.xdnd_enter {
             self.active_enter = Some(data);
             self.current_target = None;
@@ -181,6 +195,18 @@ impl X11DropRouter {
             }
             self.active_enter = None;
             self.current_target = None;
+        }
+        Ok(())
+    }
+
+    /// Drop any route in progress without letting the editor see the offer.
+    fn abandon_route<C: Connection>(&mut self, conn: &C) -> Result<(), X11SessionError> {
+        let target = self.current_target.take();
+        let enter = self.active_enter.take();
+        if let Some(target) = target
+            && let Some(enter) = enter
+        {
+            self.forward(conn, target, self.atoms.xdnd_leave, [enter[0], 0, 0, 0, 0])?;
         }
         Ok(())
     }

@@ -3,6 +3,7 @@ use std::fmt;
 
 mod drop_router;
 mod mime;
+mod outbound;
 mod wayland_bridge;
 
 pub use drop_router::X11DropRouter;
@@ -12,6 +13,7 @@ use crate::{
     PreviewFailureStage, PreviewStatus, SessionReporter, SessionRoute, SourceContext,
 };
 use mime::MimeTargets;
+use outbound::{OutboundDrag, OutboundGuard};
 use raw_window_handle::RawWindowHandle;
 use wayland_bridge::WaylandBridgeSession;
 use x11rb::CURRENT_TIME;
@@ -419,6 +421,9 @@ impl PreviewWindow {
 pub struct X11Session {
     inner: LinuxSession,
     route: SessionRoute,
+    /// Keeps the drop router from routing this session's own drag back into
+    /// the editor while it is live.
+    outbound: OutboundGuard,
 }
 
 enum LinuxSession {
@@ -476,6 +481,10 @@ impl X11Session {
                         released: false,
                     },
                     route,
+                    outbound: OutboundGuard::acquire(OutboundDrag::new(
+                        NativeProtocol::WaylandDataDevice,
+                        source_window,
+                    )),
                 }),
                 Err(error) => {
                     let _ = release_pointer(conn, press.time);
@@ -497,6 +506,10 @@ impl X11Session {
         XdndSession::start(conn, source_window, files, reporter, press).map(|session| Self {
             inner: LinuxSession::Xdnd(Box::new(session)),
             route,
+            outbound: OutboundGuard::acquire(OutboundDrag::new(
+                NativeProtocol::Xdnd,
+                source_window,
+            )),
         })
     }
 
@@ -511,6 +524,18 @@ impl X11Session {
     /// Native Wayland sessions run on their own blocking protocol queue, so
     /// X11 events only provide an opportunity to observe terminal state.
     pub fn handle_event<C: Connection>(
+        &mut self,
+        conn: &C,
+        event: &Event,
+    ) -> Result<X11SessionStatus, X11SessionError> {
+        let status = self.drive_event(conn, event);
+        if !matches!(status, Ok(X11SessionStatus::Active)) {
+            self.outbound.release();
+        }
+        status
+    }
+
+    fn drive_event<C: Connection>(
         &mut self,
         conn: &C,
         event: &Event,
