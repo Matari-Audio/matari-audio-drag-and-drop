@@ -1636,3 +1636,25 @@ fn send_terminal(
         outcome: Outcome::Failed(SessionFailure { stage, kind }),
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{FileSet, FileSetError};
+    use std::path::PathBuf;
+
+    #[test]
+    fn file_set_rejects_an_empty_path_list() {
+        assert!(matches!(
+            FileSet::try_from_paths(Vec::new()),
+            Err(FileSetError::Empty)
+        ));
+    }
+
+    #[test]
+    fn file_set_rejects_a_relative_path() {
+        assert!(matches!(
+            FileSet::try_from_paths(vec![PathBuf::from("relative/take.flac")]),
+            Err(FileSetError::Relative(_))
+        ));
+    }
+}

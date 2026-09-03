@@ -178,8 +178,9 @@ mod tests {
 
     #[test]
     fn file_offers_include_uri_and_plain_payloads() {
-        let payload = FileDragPayloadData::new(vec![PathBuf::from("/tmp/plugin take.flac")])
-            .expect("payload should accept a non-empty file list");
+        let payload = FileDragPayloadData::from_validated(vec![PathBuf::from(
+            "/tmp/plugin take.flac",
+        )]);
 
         let offers = payload.offers();
 
@@ -198,10 +199,5 @@ mod tests {
             offer.mime_type() == MIME_GNOME_COPIED_FILES
                 && offer.data() == b"copy\nfile:///tmp/plugin%20take.flac\n"
         }));
-    }
-
-    #[test]
-    fn file_drag_payload_rejects_empty_file_list() {
-        assert!(FileDragPayloadData::new(Vec::new()).is_err());
     }
 }
