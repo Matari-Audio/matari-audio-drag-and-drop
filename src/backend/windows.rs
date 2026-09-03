@@ -111,6 +111,8 @@ pub(super) fn start_external_file_drag(
                 Outcome::Failed(SessionFailure {
                     stage: FailureStage::Transfer,
                     kind: FailureKind::NativeRejected,
+                    native_code: Some(result.0),
+                    native_effect: Some(effect.0),
                 })
             };
             reporter.finish(outcome);
@@ -159,17 +161,13 @@ impl SourceDragImage {
             let _ = unsafe { ImageList_Destroy(Some(list)) };
             return Err(PreviewAttachError::new(PreviewFailureStage::Helper, None));
         }
+        // Hotspot matches the source chip cursor offset so the native image
+        // appears where the in-app drag ghost was, instead of jumping the
+        // image center onto the cursor at handoff.
+        const HOTSPOT_X: i32 = 20;
+        const HOTSPOT_Y: i32 = 22;
         // SAFETY: The list contains image zero and the hotspot is within its bounds.
-        if !unsafe {
-            ImageList_BeginDrag(
-                list,
-                0,
-                crate::preview::WIDTH as i32 / 2,
-                crate::preview::HEIGHT as i32 / 2,
-            )
-        }
-        .as_bool()
-        {
+        if !unsafe { ImageList_BeginDrag(list, 0, HOTSPOT_X, HOTSPOT_Y) }.as_bool() {
             // SAFETY: BeginDrag failed, so this branch still uniquely owns the list.
             let _ = unsafe { ImageList_Destroy(Some(list)) };
             return Err(PreviewAttachError::new(PreviewFailureStage::Attach, None));
