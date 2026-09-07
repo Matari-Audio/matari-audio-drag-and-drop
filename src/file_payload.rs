@@ -178,8 +178,8 @@ mod tests {
 
     #[test]
     fn file_offers_include_uri_and_plain_payloads() {
-        let payload = FileDragPayloadData::new(vec![PathBuf::from("/tmp/plugin take.flac")])
-            .expect("payload should accept a non-empty file list");
+        let payload =
+            FileDragPayloadData::from_validated(vec![PathBuf::from("/tmp/plugin take.flac")]);
 
         let offers = payload.offers();
 
@@ -201,7 +201,11 @@ mod tests {
     }
 
     #[test]
-    fn file_drag_payload_rejects_empty_file_list() {
-        assert!(FileDragPayloadData::new(Vec::new()).is_err());
+    fn file_set_rejects_empty_file_list() {
+        // Emptiness is now rejected upstream, when the caller validates the file set.
+        assert!(matches!(
+            crate::FileSet::try_from_paths(Vec::new()),
+            Err(crate::FileSetError::Empty)
+        ));
     }
 }
