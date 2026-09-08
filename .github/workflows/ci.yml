@@ -2,14 +2,17 @@ name: CI
 
 on:
   pull_request:
+  merge_group:
   push:
-    branches:
-      - main
+    branches: [main]
+permissions: {}
 
 jobs:
   linux:
     name: Linux
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -43,6 +46,8 @@ jobs:
   windows:
     name: Windows
     runs-on: windows-latest
+    permissions:
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -58,6 +63,8 @@ jobs:
   macos:
     name: macOS
     runs-on: macos-latest
+    permissions:
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -73,6 +80,8 @@ jobs:
   msrv:
     name: Rust 1.95 MSRV
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -89,6 +98,8 @@ jobs:
   dependency-policy:
     name: Dependency policy
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -97,3 +108,12 @@ jobs:
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           rust-version: "1.95.0"
+
+  # Single required check for branch rulesets and the merge queue.
+  conclusion:
+    if: ${{ !cancelled() }}
+    needs: [linux, windows, macos, msrv, dependency-policy]
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - run: jq --exit-status 'all(.result == "success" or .result == "skipped")' <<< '${{ toJson(needs) }}'
