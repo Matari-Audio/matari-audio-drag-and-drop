@@ -5,6 +5,7 @@ mod drop_router;
 mod mime;
 mod wayland_bridge;
 
+use drop_router::OutboundGuard;
 pub use drop_router::X11DropRouter;
 
 use crate::{
@@ -419,6 +420,8 @@ impl PreviewWindow {
 pub struct X11Session {
     inner: LinuxSession,
     route: SessionRoute,
+    /// Keeps [`X11DropRouter`] from routing this drag back to the editor.
+    outbound: Option<OutboundGuard>,
 }
 
 enum LinuxSession {
@@ -476,6 +479,7 @@ impl X11Session {
                         released: false,
                     },
                     route,
+                    outbound: Some(OutboundGuard::register(None)),
                 }),
                 Err(error) => {
                     let _ = release_pointer(conn, press.time);
@@ -497,6 +501,7 @@ impl X11Session {
         XdndSession::start(conn, source_window, files, reporter, press).map(|session| Self {
             inner: LinuxSession::Xdnd(Box::new(session)),
             route,
+            outbound: Some(OutboundGuard::register(Some(source_window))),
         })
     }
 
@@ -511,6 +516,18 @@ impl X11Session {
     /// Native Wayland sessions run on their own blocking protocol queue, so
     /// X11 events only provide an opportunity to observe terminal state.
     pub fn handle_event<C: Connection>(
+        &mut self,
+        conn: &C,
+        event: &Event,
+    ) -> Result<X11SessionStatus, X11SessionError> {
+        let status = self.drive(conn, event);
+        if !matches!(status, Ok(X11SessionStatus::Active)) || self.transfer_complete() {
+            self.outbound = None;
+        }
+        status
+    }
+
+    fn drive<C: Connection>(
         &mut self,
         conn: &C,
         event: &Event,

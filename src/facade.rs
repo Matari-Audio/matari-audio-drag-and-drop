@@ -1428,6 +1428,11 @@ impl Controller {
     }
 
     /// Drive one event-scoped inbound offer.
+    ///
+    /// While this controller's own outbound drag is in flight the offer is
+    /// refused without surfacing it: AppKit and the XWayland window manager both
+    /// hand a drag back to the view that started it, and deciding on that
+    /// reflection makes the editor reject its own export and cancel the drag.
     pub fn handle_inbound<A, D>(
         &mut self,
         adapter: &mut A,
@@ -1437,6 +1442,9 @@ impl Controller {
         A: ToolkitAdapter,
         D: for<'a> FnMut(&InboundOffer<'a>) -> InboundDecision,
     {
+        if self.outbound_in_flight() {
+            return Ok(InboundDisposition::Reject);
+        }
         let mut handler = ControllerInbound {
             active: &mut self.active_inbound,
             pending: &mut self.pending,
@@ -1635,4 +1643,101 @@ fn send_terminal(
         session,
         outcome: Outcome::Failed(SessionFailure { stage, kind }),
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Controller, FileSet, InboundDecision, InboundDisposition, InboundHandler, InboundOffer,
+        NativeProtocol, RejectedStart, SessionEvent, SessionRoute, SourceContext, StartTicket,
+        ToolkitAdapter,
+    };
+
+    const ROUTE: SessionRoute = SessionRoute {
+        protocol: NativeProtocol::Xdnd,
+        source: SourceContext::EmbeddedX11,
+    };
+
+    struct StubAdapter {
+        scheduled: Option<StartTicket>,
+        inbound_driven: bool,
+    }
+
+    impl ToolkitAdapter for StubAdapter {
+        type Error = std::io::Error;
+
+        fn outbound_route(&self) -> Option<SessionRoute> {
+            Some(ROUTE)
+        }
+
+        fn schedule_outbound(
+            &mut self,
+            ticket: StartTicket,
+        ) -> Result<(), RejectedStart<Self::Error>> {
+            self.scheduled = Some(ticket);
+            Ok(())
+        }
+
+        fn drive_inbound(
+            &mut self,
+            handler: &mut dyn InboundHandler,
+        ) -> Result<InboundDisposition, Self::Error> {
+            self.inbound_driven = true;
+            match handler.decide(InboundOffer {
+                paths: &[],
+                route: ROUTE,
+            }) {
+                InboundDecision::AcceptCopy => Ok(InboundDisposition::AcceptCopy),
+                InboundDecision::Reject(_) => Ok(InboundDisposition::Reject),
+            }
+        }
+    }
+
+    fn stub() -> StubAdapter {
+        StubAdapter {
+            scheduled: None,
+            inbound_driven: false,
+        }
+    }
+
+    fn own_files() -> FileSet {
+        FileSet::try_from_paths([std::env::current_exe().expect("test binary path")])
+            .expect("test binary is a readable file")
+    }
+
+    #[test]
+    fn a_live_outbound_drag_is_never_offered_back_to_the_editor() {
+        let mut adapter = stub();
+        let mut controller = Controller::new();
+        controller
+            .start_outbound(&mut adapter, own_files())
+            .expect("outbound start");
+
+        let disposition = controller
+            .handle_inbound(&mut adapter, |_| InboundDecision::AcceptCopy)
+            .expect("inbound drive");
+
+        assert_eq!(disposition, InboundDisposition::Reject);
+        assert!(!adapter.inbound_driven);
+        assert!(
+            !controller
+                .update()
+                .events()
+                .iter()
+                .any(|event| matches!(event, SessionEvent::InboundOffered { .. }))
+        );
+    }
+
+    #[test]
+    fn foreign_offers_still_reach_the_editor() {
+        let mut adapter = stub();
+        let mut controller = Controller::new();
+
+        let disposition = controller
+            .handle_inbound(&mut adapter, |_| InboundDecision::AcceptCopy)
+            .expect("inbound drive");
+
+        assert_eq!(disposition, InboundDisposition::AcceptCopy);
+        assert!(adapter.inbound_driven);
+    }
 }
