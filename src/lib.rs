@@ -6,6 +6,7 @@ mod file_payload;
 #[cfg(not(all(target_family = "unix", not(target_os = "macos"))))]
 mod platform;
 mod preview;
+pub mod toolkit;
 mod wayland;
 
 pub use file_payload::FileDragOffer;
