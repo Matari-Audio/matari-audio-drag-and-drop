@@ -20,6 +20,7 @@ include = [
     "LICENSE-MIT",
     "README.md",
     "SECURITY.md",
+    "examples/**/*.rs",
     "src/**/*.rs",
 ]
 
