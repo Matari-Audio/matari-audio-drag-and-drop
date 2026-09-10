@@ -1,0 +1,74 @@
+name: Drag route report
+description: A drag or drop that fails, or a dated run qualifying a route.
+labels: ["route-report"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Matari treats a route as supported only once a dated run records the
+        whole environment. The same fields make a failure reproducible, so
+        this one form covers both.
+  - type: input
+    id: version
+    attributes:
+      label: Matari version or commit
+    validations:
+      required: true
+  - type: dropdown
+    id: direction
+    attributes:
+      label: Direction
+      options:
+        - Outbound (dragging out of the editor)
+        - Inbound (dropping onto the editor)
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      description: Distribution and version, or Windows/macOS build.
+    validations:
+      required: true
+  - type: input
+    id: compositor
+    attributes:
+      label: Desktop session
+      description: |
+        On Linux: compositor and whether the editor runs under XWayland
+        (`echo $XDG_SESSION_TYPE $XDG_CURRENT_DESKTOP`). Leave blank elsewhere.
+  - type: input
+    id: host
+    attributes:
+      label: Host and plug-in format
+      description: e.g. REAPER 7.30, CLAP; or standalone.
+    validations:
+      required: true
+  - type: input
+    id: toolkit
+    attributes:
+      label: Toolkit and integration
+      description: e.g. baseview + egui via `toolkit::X11Host`, or a hand-written adapter.
+    validations:
+      required: true
+  - type: input
+    id: target
+    attributes:
+      label: Drag partner
+      description: The application dragged to, or dragged from.
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Terminal outcome
+      description: |
+        The last `SessionEvent` the controller produced, or the exact
+        `Outcome`/`LinuxOutcome`. "Nothing happened" is a valid answer — say
+        whether any event arrived at all.
+    validations:
+      required: true
+  - type: checkboxes
+    id: router
+    attributes:
+      label: Embedded X11 editors
+      options:
+        - label: "`X11Host::attach` (or an equivalent `X11DropRouter`) is installed, and I have logged what it returned."

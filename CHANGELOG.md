@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.0 - Unreleased
+
+- Add `toolkit::X11Host`: one owned value that gives a toolkit inbound drop routing, outbound session bookkeeping, and pointer authority behind `attach`, `handle_event`, `start_drag`, and `shutdown`, replacing roughly 200 lines of per-toolkit integration.
+- Document installation, a quick start, and a per-platform checklist of what an integration must provide, so the inbound routing step cannot be silently skipped.
+- Collect the environment Matari needs to qualify a route through an issue template.
+
 ## 0.1.6 - Unreleased
 
 - Preserve the X11 source gesture through Hyprland's native Wayland bridge so a completed XWayland drop always releases the editor and later drags keep working.

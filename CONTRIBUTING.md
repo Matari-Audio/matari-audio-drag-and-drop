@@ -24,3 +24,11 @@ cargo publish --dry-run --locked
 Native compatibility claims also need dated evidence from the named operating
 system, host, plug-in format, presentation, source and target backends, payload,
 and terminal protocol outcome.
+
+## Toolkit hosts
+
+`toolkit::X11Host` exists so an integration does not re-derive pointer
+authority, session bookkeeping, and drop-router lifetime by hand. Prefer
+extending a host over documenting another manual wiring: a step a toolkit has
+to remember is a step some toolkit will omit, and an omitted drop router fails
+silently rather than loudly.
