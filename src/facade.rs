@@ -604,10 +604,13 @@ impl StartTicket {
             delivery: Arc::clone(&delivery),
         };
         match runtime.start_drag(origin, inner.files, reporter) {
-            Ok(route) if route == inner.route => {
+            // Only the protocol is the runtime's to report. A built-in runtime
+            // cannot tell an embedded editor from a detached one, so the
+            // adapter's source selection stands.
+            Ok(route) if route.protocol == inner.route.protocol => {
                 delivery.commit(TicketEvent::Started {
                     session: inner.session,
-                    route,
+                    route: inner.route,
                 });
                 Ok(())
             }
@@ -1061,7 +1064,8 @@ pub trait NativeRuntimePort {
     ///
     /// On success, retain `reporter` until one terminal outcome. Synchronous
     /// runtimes may report before returning; the controller buffers those
-    /// events until the start commits.
+    /// events until the start commits. Only the returned route's protocol is
+    /// checked; the session keeps the adapter-selected source context.
     fn start_drag(
         &mut self,
         origin: DragOrigin<'_>,
@@ -1659,9 +1663,10 @@ fn send_terminal(
 #[cfg(test)]
 mod tests {
     use super::{
-        Controller, FileSet, InboundDecision, InboundDisposition, InboundHandler, InboundOffer,
-        NativeProtocol, RejectedStart, SessionEvent, SessionRoute, SourceContext, StartTicket,
-        ToolkitAdapter,
+        Controller, DragOrigin, FailureKind, FailureStage, FileSet, InboundDecision,
+        InboundDisposition, InboundHandler, InboundOffer, NativeProtocol, NativeReporter,
+        NativeRuntimePort, Outcome, RejectedStart, SessionEvent, SessionFailure, SessionRoute,
+        SourceContext, StartTicket, ToolkitAdapter,
     };
 
     const ROUTE: SessionRoute = SessionRoute {
@@ -1702,6 +1707,104 @@ mod tests {
                 InboundDecision::Reject(_) => Ok(InboundDisposition::Reject),
             }
         }
+    }
+
+    /// Origin for runtimes that never touch the window.
+    struct XlibWindow;
+
+    impl raw_window_handle::HasWindowHandle for XlibWindow {
+        fn window_handle(
+            &self,
+        ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
+            // SAFETY: the stub runtimes below never dereference the handle.
+            Ok(unsafe {
+                raw_window_handle::WindowHandle::borrow_raw(
+                    raw_window_handle::XlibWindowHandle::new(1).into(),
+                )
+            })
+        }
+    }
+
+    impl raw_window_handle::HasDisplayHandle for XlibWindow {
+        fn display_handle(
+            &self,
+        ) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
+            // SAFETY: as above.
+            Ok(unsafe {
+                raw_window_handle::DisplayHandle::borrow_raw(
+                    raw_window_handle::XlibDisplayHandle::new(None, 0).into(),
+                )
+            })
+        }
+    }
+
+    /// Reports a fixed route, as a built-in runtime reports its own guess.
+    struct ReportingRuntime(SessionRoute);
+
+    impl NativeRuntimePort for ReportingRuntime {
+        type Error = std::convert::Infallible;
+
+        fn start_drag(
+            &mut self,
+            _origin: DragOrigin<'_>,
+            _files: FileSet,
+            _reporter: NativeReporter,
+        ) -> Result<SessionRoute, Self::Error> {
+            Ok(self.0)
+        }
+    }
+
+    fn start_with_runtime_route(actual: SessionRoute) -> (Controller, bool) {
+        let mut controller = Controller::new();
+        let mut adapter = stub();
+        controller
+            .start_outbound(&mut adapter, own_files())
+            .expect("start scheduled");
+        let origin = DragOrigin::from_window(&XlibWindow).expect("xlib origin");
+        let started = adapter
+            .scheduled
+            .take()
+            .expect("ticket scheduled")
+            .start(&mut ReportingRuntime(actual), origin)
+            .is_ok();
+        (controller, started)
+    }
+
+    #[test]
+    fn a_runtime_source_guess_does_not_reject_the_selected_route() {
+        // The built-in AppKit and OLE runtimes always report the embedded
+        // source; a detached (standalone) editor selected the detached one.
+        let (mut controller, started) = start_with_runtime_route(SessionRoute {
+            source: SourceContext::DetachedX11,
+            ..ROUTE
+        });
+
+        assert!(started);
+        assert!(matches!(
+            &*controller.update().events,
+            [SessionEvent::OutboundStarted { route: ROUTE, .. }]
+        ));
+    }
+
+    #[test]
+    fn a_runtime_on_another_protocol_is_still_rejected() {
+        let (mut controller, started) = start_with_runtime_route(SessionRoute {
+            protocol: NativeProtocol::AppKit,
+            ..ROUTE
+        });
+
+        assert!(!started);
+        assert!(matches!(
+            &*controller.update().events,
+            [SessionEvent::OutboundTerminal {
+                outcome: Outcome::Failed(SessionFailure {
+                    stage: FailureStage::Start,
+                    kind: FailureKind::NativeRejected,
+                    ..
+                }),
+                ..
+            }]
+        ));
     }
 
     fn stub() -> StubAdapter {
