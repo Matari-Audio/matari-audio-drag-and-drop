@@ -296,6 +296,12 @@ pub struct SessionFailure {
     pub stage: FailureStage,
     /// Stable failure category.
     pub kind: FailureKind,
+    /// Native status code when the platform exposes one (for example the
+    /// Windows `DoDragDrop` `HRESULT` on a transfer failure).
+    pub native_code: Option<i32>,
+    /// Native drop effect when the platform reports one (Windows
+    /// `DROPEFFECT` bits on a transfer failure).
+    pub native_effect: Option<u32>,
 }
 
 /// Native drag-preview state.
@@ -1633,6 +1639,11 @@ fn send_terminal(
 ) {
     events.send(TicketEvent::Terminal {
         session,
-        outcome: Outcome::Failed(SessionFailure { stage, kind }),
+        outcome: Outcome::Failed(SessionFailure {
+            stage,
+            kind,
+            native_code: None,
+            native_effect: None,
+        }),
     });
 }

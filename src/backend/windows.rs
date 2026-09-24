@@ -6,12 +6,14 @@ use std::sync::Mutex;
 
 use raw_window_handle::RawWindowHandle;
 use windows::Win32::Foundation::{
-    DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, DV_E_FORMATETC, E_NOTIMPL,
-    GlobalFree, HANDLE, HGLOBAL, HWND, OLE_E_ADVISENOTSUPPORTED, POINT, RPC_E_CHANGED_MODE,
+    COLORREF, DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, DV_E_FORMATETC,
+    E_NOTIMPL, GlobalFree, HANDLE, HGLOBAL, HWND, OLE_E_ADVISENOTSUPPORTED, POINT,
+    RPC_E_CHANGED_MODE, SIZE,
 };
 use windows::Win32::Graphics::Gdi::{
-    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateDIBSection, DIB_RGB_COLORS, DeleteObject, HBITMAP,
-    HDC,
+    AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
+    CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, HBITMAP, HDC,
+    SelectObject,
 };
 use windows::Win32::System::Com::{
     DATADIR_GET, DVASPECT_CONTENT, FORMATETC, IAdviseSink, IDataObject, IDataObject_Impl,
@@ -24,15 +26,19 @@ use windows::Win32::System::Ole::{
     IDropSource_Impl, OleDuplicateData, OleInitialize, OleUninitialize,
 };
 use windows::Win32::System::SystemServices::{MK_LBUTTON, MODIFIERKEYS_FLAGS};
-use windows::Win32::UI::Controls::{
-    HIMAGELIST, ILC_COLOR32, ImageList_Add, ImageList_BeginDrag, ImageList_Create,
-    ImageList_Destroy, ImageList_DragEnter, ImageList_DragLeave, ImageList_DragMove,
-    ImageList_EndDrag,
+use windows::Win32::UI::HiDpi::{
+    DPI_AWARENESS_CONTEXT, GetDpiForWindow, GetWindowDpiAwarenessContext,
+    SetThreadDpiAwarenessContext,
 };
 use windows::Win32::UI::Shell::{
     CFSTR_FILENAMEW, CFSTR_PREFERREDDROPEFFECT, DROPFILES, SHCreateStdEnumFmtEtc,
 };
-use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, GetDesktopWindow};
+use windows::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DestroyWindow, GetCursorPos, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOSIZE,
+    SWP_SHOWWINDOW, SetWindowPos, ULW_ALPHA, USER_DEFAULT_SCREEN_DPI, UpdateLayeredWindow,
+    WS_DISABLED, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_EX_TRANSPARENT, WS_POPUP,
+};
 use windows::core::implement;
 use windows_core::{BOOL, HRESULT, IUnknown, PCWSTR, Ref, Result};
 
@@ -67,25 +73,26 @@ pub(super) fn start_external_file_drag(
 
     let _ole = OleDragApartment::initialize()?;
     let data_object: IDataObject = FileDataObject::new(paths)?.into();
-    let drag_image = preview
-        .as_ref()
-        .and_then(|preview| match SourceDragImage::new(preview) {
-            Ok(image) => {
-                if let Some(reporter) = &reporter {
-                    reporter.preview(PreviewStatus::Attached);
+    let drag_image =
+        preview
+            .as_ref()
+            .and_then(|preview| match SourceDragImage::new(preview, hwnd) {
+                Ok(image) => {
+                    if let Some(reporter) = &reporter {
+                        reporter.preview(PreviewStatus::Attached);
+                    }
+                    Some(image)
                 }
-                Some(image)
-            }
-            Err(error) => {
-                if let Some(reporter) = &reporter {
-                    reporter.preview(PreviewStatus::Unavailable {
-                        stage: error.stage,
-                        native_code: error.native_code,
-                    });
+                Err(error) => {
+                    if let Some(reporter) = &reporter {
+                        reporter.preview(PreviewStatus::Unavailable {
+                            stage: error.stage,
+                            native_code: error.native_code,
+                        });
+                    }
+                    None
                 }
-                None
-            }
-        });
+            });
     let drop_source: IDropSource = FileDropSource { drag_image }.into();
     let mut effect = DROPEFFECT(0);
     // SAFETY: OLE is initialized on this GUI thread, both COM interfaces remain
@@ -111,6 +118,8 @@ pub(super) fn start_external_file_drag(
                 Outcome::Failed(SessionFailure {
                     stage: FailureStage::Transfer,
                     kind: FailureKind::NativeRejected,
+                    native_code: Some(result.0),
+                    native_effect: Some(effect.0),
                 })
             };
             reporter.finish(outcome);
@@ -131,68 +140,133 @@ impl Drop for DragBitmapGuard {
     }
 }
 
-struct SourceDragImage(HIMAGELIST, HWND);
+/// Source-side drag thumbnail: a layered top-level window that follows the
+/// cursor at the same offset as the in-app chip.
+///
+/// The Shell `IDragSourceHelper` only draws when the drop target calls
+/// `IDropTargetHelper` (Explorer does; DAWs mostly do not), and the legacy
+/// `ImageList_DragMove` path paints a fixed-size, ~75% alpha image straight on
+/// the screen DC, which is what users saw as "translucent, wrong size, jumps
+/// to the corner". A layered window owned by us is composited by DWM, keeps
+/// full alpha, and is sized at the plugin window's DPI.
+struct SourceDragImage {
+    hwnd: HWND,
+    _bitmap: DragBitmapGuard,
+    context: DPI_AWARENESS_CONTEXT,
+    offset: POINT,
+}
+
+/// In-app chip offset from the cursor, in logical pixels
+/// (`src/export/drag.rs` `CHIP_OFFSET` on the BUFFR side).
+const CHIP_OFFSET: (f32, f32) = (20.0, 22.0);
 
 impl SourceDragImage {
-    fn new(preview: &DragPreview) -> std::result::Result<Self, PreviewAttachError> {
-        let pixels = crate::preview::render(preview);
+    fn new(preview: &DragPreview, owner: HWND) -> std::result::Result<Self, PreviewAttachError> {
+        // SAFETY: `owner` is the live plugin window this drag started from.
+        let context = unsafe { GetWindowDpiAwarenessContext(owner) };
+        let _dpi = ThreadDpiContext::enter(context);
+        // SAFETY: `owner` is a live window; a zero result means "unaware".
+        let dpi = unsafe { GetDpiForWindow(owner) };
+        let scale = if dpi == 0 {
+            1.0
+        } else {
+            dpi as f32 / USER_DEFAULT_SCREEN_DPI as f32
+        };
+        let canvas = crate::preview::render_scaled(preview, scale);
         let bitmap = DragBitmapGuard(
-            create_drag_bitmap(&pixels, crate::preview::WIDTH, crate::preview::HEIGHT)
+            create_drag_bitmap(&canvas.pixels, canvas.width, canvas.height)
                 .map_err(|_| PreviewAttachError::new(PreviewFailureStage::Bitmap, None))?,
         );
-        // SAFETY: The image list copies the live bitmap before the bitmap guard is dropped.
-        let list = unsafe {
-            ImageList_Create(
-                crate::preview::WIDTH as i32,
-                crate::preview::HEIGHT as i32,
-                ILC_COLOR32,
-                1,
-                0,
-            )
+        let offset = POINT {
+            x: (CHIP_OFFSET.0 * scale).round() as i32,
+            y: (CHIP_OFFSET.1 * scale).round() as i32,
         };
-        if list.is_invalid() {
-            return Err(PreviewAttachError::new(PreviewFailureStage::Helper, None));
-        }
-        // SAFETY: Both the image list and bitmap are live; the list copies the bitmap.
-        if unsafe { ImageList_Add(list, bitmap.0, None) } < 0 {
-            // SAFETY: This branch still uniquely owns the live image list.
-            let _ = unsafe { ImageList_Destroy(Some(list)) };
-            return Err(PreviewAttachError::new(PreviewFailureStage::Helper, None));
-        }
-        // SAFETY: The list contains image zero and the hotspot is within its bounds.
-        if !unsafe {
-            ImageList_BeginDrag(
-                list,
-                0,
-                crate::preview::WIDTH as i32 / 2,
-                crate::preview::HEIGHT as i32 / 2,
+        let mut cursor = POINT::default();
+        // SAFETY: `cursor` is a writable `POINT`.
+        let _ = unsafe { GetCursorPos(&mut cursor) };
+        // SAFETY: "STATIC" is a system window class, all pointer arguments are
+        // null, and the window is destroyed in `Drop`.
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_LAYERED
+                    | WS_EX_TRANSPARENT
+                    | WS_EX_TOPMOST
+                    | WS_EX_TOOLWINDOW
+                    | WS_EX_NOACTIVATE,
+                windows_core::w!("STATIC"),
+                PCWSTR::null(),
+                WS_POPUP | WS_DISABLED,
+                cursor.x + offset.x,
+                cursor.y + offset.y,
+                canvas.width as i32,
+                canvas.height as i32,
+                None,
+                None,
+                None,
+                None,
             )
         }
-        .as_bool()
-        {
-            // SAFETY: BeginDrag failed, so this branch still uniquely owns the list.
-            let _ = unsafe { ImageList_Destroy(Some(list)) };
-            return Err(PreviewAttachError::new(PreviewFailureStage::Attach, None));
-        }
-        let mut cursor = POINT::default();
-        // SAFETY: The desktop window is process-independent and remains valid
-        // for the synchronous drag operation.
-        let lock_window = unsafe { GetDesktopWindow() };
-        // SAFETY: The drag image is active, the cursor pointer is writable,
-        // and Win32 requires a real owner for stable drawing and coordinates.
+        .map_err(|error| {
+            PreviewAttachError::new(PreviewFailureStage::Helper, Some(error.code().0))
+        })?;
+        let image = Self {
+            hwnd,
+            _bitmap: bitmap,
+            context,
+            offset,
+        };
+        // SAFETY: `hwnd` is the layered window created above and the DIB is
+        // alive for the whole call; the memory DC is released before return.
         unsafe {
-            let _ = GetCursorPos(&mut cursor);
-            let _ = ImageList_DragEnter(lock_window, cursor.x, cursor.y);
+            let source = CreateCompatibleDC(None);
+            let previous = SelectObject(source, image._bitmap.0.into());
+            let size = SIZE {
+                cx: canvas.width as i32,
+                cy: canvas.height as i32,
+            };
+            let origin = POINT::default();
+            let blend = BLENDFUNCTION {
+                BlendOp: AC_SRC_OVER as u8,
+                BlendFlags: 0,
+                SourceConstantAlpha: 255,
+                AlphaFormat: AC_SRC_ALPHA as u8,
+            };
+            let result = UpdateLayeredWindow(
+                hwnd,
+                None,
+                None,
+                Some(&size),
+                Some(source),
+                Some(&origin),
+                COLORREF(0),
+                Some(&blend),
+                ULW_ALPHA,
+            );
+            SelectObject(source, previous);
+            let _ = DeleteDC(source);
+            result.map_err(|error| {
+                PreviewAttachError::new(PreviewFailureStage::Attach, Some(error.code().0))
+            })?;
         }
-        Ok(Self(list, lock_window))
+        image.move_to_cursor();
+        Ok(image)
     }
 
     fn move_to_cursor(&self) {
+        let _dpi = ThreadDpiContext::enter(self.context);
         let mut cursor = POINT::default();
-        // SAFETY: The drag image is active and `cursor` is writable.
+        // SAFETY: `cursor` is a writable `POINT` and `hwnd` is alive until `Drop`.
         unsafe {
             if GetCursorPos(&mut cursor).is_ok() {
-                let _ = ImageList_DragMove(cursor.x, cursor.y);
+                let _ = SetWindowPos(
+                    self.hwnd,
+                    Some(HWND_TOPMOST),
+                    cursor.x + self.offset.x,
+                    cursor.y + self.offset.y,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                );
             }
         }
     }
@@ -200,12 +274,32 @@ impl SourceDragImage {
 
 impl Drop for SourceDragImage {
     fn drop(&mut self) {
-        // SAFETY: This ends the active drag image on the same owning window
-        // before destroying its uniquely owned image list.
+        // SAFETY: This struct uniquely owns the window it created.
         unsafe {
-            let _ = ImageList_DragLeave(self.1);
-            ImageList_EndDrag();
-            let _ = ImageList_Destroy(Some(self.0));
+            let _ = DestroyWindow(self.hwnd);
+        }
+    }
+}
+
+/// Runs cursor and window calls in the plugin window's DPI awareness context
+/// so `GetCursorPos`, `GetDpiForWindow` and `SetWindowPos` agree on one
+/// coordinate space, whatever the host process default is.
+struct ThreadDpiContext(DPI_AWARENESS_CONTEXT);
+
+impl ThreadDpiContext {
+    fn enter(context: DPI_AWARENESS_CONTEXT) -> Self {
+        // SAFETY: Thread-local state change, restored in `Drop`.
+        Self(unsafe { SetThreadDpiAwarenessContext(context) })
+    }
+}
+
+impl Drop for ThreadDpiContext {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
+            // SAFETY: Restores the context saved in `enter` on the same thread.
+            unsafe {
+                SetThreadDpiAwarenessContext(self.0);
+            }
         }
     }
 }
@@ -400,12 +494,10 @@ impl IDataObject_Impl for FileDataObject_Impl {
             Some(ShellDragFormat::Hdrop) => self.hdrop_medium(),
             Some(ShellDragFormat::PreferredDropEffect(_)) => self.preferred_drop_effect_medium(),
             Some(ShellDragFormat::FileNameW(_)) => self.filenamew_medium(),
-            None => {
-                // SAFETY: COM requires this pointer to be null or readable for the call.
-                unsafe { pformatetcin.as_ref() }
-                    .ok_or_else(|| windows_core::Error::from(DV_E_FORMATETC))
-                    .and_then(|format| self.stored_medium(format))
-            }
+            // SAFETY: Same COM contract as above; `as_ref` handles null.
+            None => unsafe { pformatetcin.as_ref() }
+                .ok_or_else(|| windows_core::Error::from(DV_E_FORMATETC))
+                .and_then(|format| self.stored_medium(format)),
         }
     }
 
@@ -423,7 +515,7 @@ impl IDataObject_Impl for FileDataObject_Impl {
                 .iter()
                 .any(|stored| stored.matches(format))
         });
-        // SAFETY: COM requires this pointer to be null or readable for the call.
+        // SAFETY: Same COM contract as the block above.
         if unsafe { self.requested_format(pformatetc) }.is_some() || stored {
             HRESULT(0)
         } else {
@@ -577,8 +669,8 @@ impl StoredMedium {
 
     fn duplicate_medium(&self) -> Result<STGMEDIUM> {
         Self::duplicate(&self.format, &self.medium).map(|copy| {
-            // SAFETY: `copy` owns this initialized medium; it is forgotten below
-            // so ownership transfers to the returned value exactly once.
+            // SAFETY: `copy` is forgotten right after the bitwise move, so the
+            // medium is released exactly once, by the caller.
             let medium = unsafe { ptr::read(&copy.medium) };
             std::mem::forget(copy);
             medium
