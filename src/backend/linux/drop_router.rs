@@ -1,5 +1,7 @@
 //! Event-driven XDND proxy routing for plug-in editors embedded in XWayland hosts.
 
+use std::sync::{Mutex, MutexGuard, PoisonError};
+
 use x11rb::connection::Connection;
 use x11rb::protocol::Event;
 use x11rb::protocol::xproto::{
@@ -9,6 +11,43 @@ use x11rb::protocol::xproto::{
 use x11rb::wrapper::ConnectionExt as _;
 
 use super::{X11SessionError, X11WaylandBridge, XDND_VERSION, atom, x11_error, x11_wayland_bridge};
+
+/// Outbound drags started by this crate, each as its XDND source window.
+///
+/// `None` marks a native Wayland source: the compositor's XWM bridges that drag
+/// back into X under a window of its own, so no source filter can recognise the
+/// reflection and the router must stand down for the whole gesture.
+static OUTBOUND: Mutex<Vec<Option<XWindow>>> = Mutex::new(Vec::new());
+
+/// Registration of one live outbound drag, released when this guard drops.
+pub(super) struct OutboundGuard(Option<XWindow>);
+
+impl OutboundGuard {
+    /// Register a live outbound drag, `None` for a native Wayland source.
+    pub(super) fn register(source: Option<XWindow>) -> Self {
+        live_outbound().push(source);
+        Self(source)
+    }
+}
+
+impl Drop for OutboundGuard {
+    fn drop(&mut self) {
+        let mut live = live_outbound();
+        if let Some(index) = live.iter().position(|entry| *entry == self.0) {
+            live.swap_remove(index);
+        }
+    }
+}
+
+fn live_outbound() -> MutexGuard<'static, Vec<Option<XWindow>>> {
+    OUTBOUND.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Whether a live outbound drag of ours explains this XDND source window.
+fn is_self_drag(live: &[Option<XWindow>], source: XWindow) -> bool {
+    live.iter()
+        .any(|entry| entry.is_none_or(|window| window == source))
+}
 
 struct RouterAtoms {
     xdnd_aware: Atom,
@@ -160,6 +199,9 @@ impl X11DropRouter {
             return Ok(());
         }
         let data = event.data.as_data32();
+        if event.type_ != self.atoms.xdnd_leave && is_self_drag(&live_outbound(), data[0]) {
+            return self.abandon_route(conn);
+        }
         if event.type_ == self.atoms.xdnd_enter {
             self.active_enter = Some(data);
             self.current_target = None;
@@ -182,6 +224,17 @@ impl X11DropRouter {
             self.active_enter = None;
             self.current_target = None;
         }
+        Ok(())
+    }
+
+    /// Drop a bridged reflection of our own drag, leaving no phantom offer.
+    fn abandon_route<C: Connection>(&mut self, conn: &C) -> Result<(), X11SessionError> {
+        if let Some(target) = self.current_target.take()
+            && let Some(enter) = self.active_enter
+        {
+            self.forward(conn, target, self.atoms.xdnd_leave, [enter[0], 0, 0, 0, 0])?;
+        }
+        self.active_enter = None;
         Ok(())
     }
 
@@ -353,4 +406,36 @@ fn root_and_toplevel<C: Connection>(
     Err(X11SessionError::new(
         "X11 drop router exceeded the host window ancestry limit",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{OutboundGuard, is_self_drag, live_outbound};
+
+    #[test]
+    fn foreign_sources_route_when_no_outbound_drag_is_live() {
+        assert!(!is_self_drag(&[], 0x40));
+    }
+
+    #[test]
+    fn a_live_xdnd_source_suppresses_only_its_own_window() {
+        assert!(is_self_drag(&[Some(0x40)], 0x40));
+        assert!(!is_self_drag(&[Some(0x40)], 0x41));
+    }
+
+    #[test]
+    fn a_live_wayland_source_suppresses_every_bridged_source() {
+        assert!(is_self_drag(&[None], 0x41));
+    }
+
+    #[test]
+    fn each_guard_releases_exactly_one_registration() {
+        let outer = OutboundGuard::register(Some(0x40));
+        let inner = OutboundGuard::register(Some(0x40));
+        assert!(is_self_drag(&live_outbound(), 0x40));
+        drop(inner);
+        assert!(is_self_drag(&live_outbound(), 0x40));
+        drop(outer);
+        assert!(!is_self_drag(&live_outbound(), 0x40));
+    }
 }

@@ -6,6 +6,8 @@
 - Keep the Windows source thumbnail visible and anchored across DAW drop targets that do not implement the Shell target helper.
 - Report the native result code and drop effect on failed Windows transfers so hosts can distinguish a refused drop from a transport failure.
 - Draw the Windows drag thumbnail in an own layered window at the plugin window's DPI: fully opaque, same size as the in-app chip, and anchored at the chip's cursor offset instead of the image-list ghost that was translucent, fixed at 224x90 physical pixels, and jumped at handoff.
+- Ignore inbound offers that are this controller's own live outbound drag reflected back by AppKit or an XWayland window manager, so an editor can no longer reject and cancel its own export.
+- Stand down the XWayland drop router while this crate holds a live outbound drag, dropping bridged `XdndEnter`, `XdndPosition` and `XdndDrop` messages that name our own source window without stranding a phantom offer.
 
 ## 0.1.5 - Unreleased
 
