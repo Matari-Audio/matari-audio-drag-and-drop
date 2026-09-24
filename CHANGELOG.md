@@ -2,6 +2,7 @@
 
 ## 0.1.6 - Unreleased
 
+- Check only the protocol a native runtime reports at start. The built-in AppKit and OLE runtimes cannot tell a detached editor from an embedded one, so every drag from a standalone macOS app failed as `NativeRejected` after AppKit had already begun it.
 - Preserve the X11 source gesture through Hyprland's native Wayland bridge so a completed XWayland drop always releases the editor and later drags keep working.
 - Keep the Windows source thumbnail visible and anchored across DAW drop targets that do not implement the Shell target helper.
 - Report the native result code and drop effect on failed Windows transfers so hosts can distinguish a refused drop from a transport failure.
