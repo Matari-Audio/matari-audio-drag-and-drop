@@ -36,76 +36,129 @@ pub enum DragPreview {
 pub(crate) const WIDTH: usize = 224;
 pub(crate) const HEIGHT: usize = 90;
 
+/// Premultiplied BGRA pixels for one drag thumbnail.
+pub(crate) struct Canvas {
+    pub(crate) width: usize,
+    pub(crate) height: usize,
+    pub(crate) pixels: Vec<u8>,
+    scale: f32,
+}
+
+impl Canvas {
+    fn px(&self, logical: usize) -> usize {
+        (logical as f32 * self.scale).round() as usize
+    }
+}
+
+/// Render at the logical `WIDTH`x`HEIGHT`.
+#[cfg(not(target_os = "windows"))]
 pub(crate) fn render(preview: &DragPreview) -> Vec<u8> {
-    let mut pixels = vec![0_u8; WIDTH * HEIGHT * 4];
-    fill_rounded_rect(&mut pixels, 3, 4, WIDTH - 3, HEIGHT - 4, 12, [0, 0, 0, 64]);
-    fill_rounded_rect(&mut pixels, 0, 0, WIDTH, HEIGHT, 12, [22, 141, 204, 255]);
+    render_scaled(preview, 1.0).pixels
+}
+
+/// Render at `scale` times the logical size, for DPI-aware backends.
+pub(crate) fn render_scaled(preview: &DragPreview, scale: f32) -> Canvas {
+    let scale = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    let width = (WIDTH as f32 * scale).round() as usize;
+    let height = (HEIGHT as f32 * scale).round() as usize;
+    let mut canvas = Canvas {
+        width,
+        height,
+        pixels: vec![0_u8; width * height * 4],
+        scale,
+    };
+    let radius = canvas.px(12);
+    let (sx, sy) = (canvas.px(3), canvas.px(4));
     fill_rounded_rect(
-        &mut pixels,
-        1,
-        1,
-        WIDTH - 2,
-        HEIGHT - 2,
-        11,
+        &mut canvas,
+        sx,
+        sy,
+        width - sx,
+        height - sy,
+        radius,
+        [0, 0, 0, 64],
+    );
+    fill_rounded_rect(
+        &mut canvas,
+        0,
+        0,
+        width,
+        height,
+        radius,
+        [22, 141, 204, 255],
+    );
+    let border = canvas.px(1).max(1);
+    fill_rounded_rect(
+        &mut canvas,
+        border,
+        border,
+        width - 2 * border,
+        height - 2 * border,
+        radius.saturating_sub(border),
         [25, 25, 25, 255],
     );
 
     match preview {
-        DragPreview::Waveform { buckets } => waveform(&mut pixels, buckets),
+        DragPreview::Waveform { buckets } => waveform(&mut canvas, buckets),
         DragPreview::Spectral {
             columns,
             rows,
             energy,
-        } => spectral(&mut pixels, *columns, *rows, energy),
-        DragPreview::Midi { notes } => midi(&mut pixels, notes),
+        } => spectral(&mut canvas, *columns, *rows, energy),
+        DragPreview::Midi { notes } => midi(&mut canvas, notes),
     }
-    pixels
+    canvas
 }
 
-fn waveform(pixels: &mut [u8], buckets: &[(f32, f32)]) {
-    const LEFT: usize = 15;
-    const RIGHT: usize = WIDTH - 16;
-    const TOP: usize = 15;
-    const BOTTOM: usize = HEIGHT - 17;
-    let center = (TOP + BOTTOM) / 2;
-    horizontal(pixels, LEFT, RIGHT, center, [22, 141, 204, 128]);
+fn waveform(canvas: &mut Canvas, buckets: &[(f32, f32)]) {
+    let left = canvas.px(15);
+    let right = canvas.width - canvas.px(16);
+    let top = canvas.px(15);
+    let bottom = canvas.height - canvas.px(17);
+    let bar = canvas.px(2).max(1);
+    let center = (top + bottom) / 2;
+    horizontal(canvas, left, right, center, [22, 141, 204, 128]);
     let last = buckets.len().saturating_sub(1).max(1);
     for (index, &(minimum, maximum)) in buckets.iter().enumerate() {
-        let x = LEFT + index * (RIGHT - LEFT) / last;
-        let amplitude = (BOTTOM - TOP) as f32 * 0.42;
+        let x = left + index * (right - left) / last;
+        let amplitude = (bottom - top) as f32 * 0.42;
         let a = (center as f32 - maximum.clamp(-1.0, 1.0) * amplitude)
             .round()
-            .clamp(TOP as f32, BOTTOM as f32) as usize;
+            .clamp(top as f32, bottom as f32) as usize;
         let b = (center as f32 - minimum.clamp(-1.0, 1.0) * amplitude)
             .round()
-            .clamp(TOP as f32, BOTTOM as f32) as usize;
+            .clamp(top as f32, bottom as f32) as usize;
         fill_rect(
-            pixels,
+            canvas,
             x,
             a.min(b),
-            2,
+            bar,
             a.max(b).saturating_sub(a.min(b)).max(1),
             [0, 170, 255, 255],
         );
     }
 }
 
-fn spectral(pixels: &mut [u8], columns: usize, rows: usize, energy: &[f32]) {
+fn spectral(canvas: &mut Canvas, columns: usize, rows: usize, energy: &[f32]) {
     if columns == 0 || rows == 0 {
         return;
     }
-    const LEFT: usize = 14;
-    const TOP: usize = 14;
-    const DRAW_WIDTH: usize = WIDTH - 28;
-    const DRAW_HEIGHT: usize = HEIGHT - 28;
-    for y in 0..DRAW_HEIGHT {
-        for x in 0..DRAW_WIDTH {
+    let left = canvas.px(14);
+    let top = canvas.px(14);
+    let draw_width = canvas.width - 2 * left;
+    let draw_height = canvas.height - 2 * top;
+    for y in 0..draw_height {
+        for x in 0..draw_width {
             let column = x as f32 * columns.saturating_sub(1) as f32
-                / DRAW_WIDTH.saturating_sub(1).max(1) as f32;
-            let row = (DRAW_HEIGHT - 1 - y) as f32 * rows.saturating_sub(1) as f32
-                / DRAW_HEIGHT.saturating_sub(1).max(1) as f32;
+                / draw_width.saturating_sub(1).max(1) as f32;
+            let row = (draw_height - 1 - y) as f32 * rows.saturating_sub(1) as f32
+                / draw_height.saturating_sub(1).max(1) as f32;
             let value = sample_spectral(energy, columns, rows, column, row);
-            set_pixel(pixels, LEFT + x, TOP + y, spectral_color(value));
+            set_pixel(canvas, left + x, top + y, spectral_color(value));
         }
     }
 }
@@ -129,30 +182,31 @@ fn sample_spectral(energy: &[f32], columns: usize, rows: usize, column: f32, row
     top + (bottom - top) * ty
 }
 
-fn midi(pixels: &mut [u8], notes: &[MidiPreviewNote]) {
-    const LEFT: f32 = 14.0;
-    const TOP: f32 = 14.0;
-    const DRAW_WIDTH: f32 = (WIDTH - 28) as f32;
-    const DRAW_HEIGHT: f32 = (HEIGHT - 28) as f32;
+fn midi(canvas: &mut Canvas, notes: &[MidiPreviewNote]) {
+    let left = canvas.px(14) as f32;
+    let top = canvas.px(14) as f32;
+    let draw_width = canvas.width as f32 - 2.0 * left;
+    let draw_height = canvas.height as f32 - 2.0 * top;
     if notes.is_empty() {
         horizontal(
-            pixels,
-            LEFT as usize,
-            (LEFT + DRAW_WIDTH) as usize,
-            (TOP + DRAW_HEIGHT * 0.5) as usize,
+            canvas,
+            left as usize,
+            (left + draw_width) as usize,
+            (top + draw_height * 0.5) as usize,
             [55, 72, 92, 255],
         );
         return;
     }
+    let scale = canvas.scale;
     for note in notes.iter().take(96) {
         let start = note.start.clamp(0.0, 1.0);
         let end = note.end.max(start + 0.01).clamp(0.0, 1.0);
-        let height = (DRAW_HEIGHT / 18.0).clamp(3.0, 7.0);
+        let height = (draw_height / 18.0).clamp(3.0 * scale, 7.0 * scale);
         fill_rect(
-            pixels,
-            (LEFT + start * DRAW_WIDTH).round() as usize,
-            (TOP + (1.0 - note.pitch.clamp(0.0, 1.0)) * (DRAW_HEIGHT - height)).round() as usize,
-            ((end - start) * DRAW_WIDTH).round().max(2.0) as usize,
+            canvas,
+            (left + start * draw_width).round() as usize,
+            (top + (1.0 - note.pitch.clamp(0.0, 1.0)) * (draw_height - height)).round() as usize,
+            ((end - start) * draw_width).round().max(2.0 * scale) as usize,
             height.round() as usize,
             [0, 170, 255, 255],
         );
@@ -184,16 +238,16 @@ fn spectral_color(value: f32) -> [u8; 4] {
     ]
 }
 
-fn fill_rect(pixels: &mut [u8], x: usize, y: usize, width: usize, height: usize, color: [u8; 4]) {
-    for row in y..y.saturating_add(height).min(HEIGHT) {
-        for column in x..x.saturating_add(width).min(WIDTH) {
-            set_pixel(pixels, column, row, color);
+fn fill_rect(canvas: &mut Canvas, x: usize, y: usize, width: usize, height: usize, color: [u8; 4]) {
+    for row in y..y.saturating_add(height).min(canvas.height) {
+        for column in x..x.saturating_add(width).min(canvas.width) {
+            set_pixel(canvas, column, row, color);
         }
     }
 }
 
 fn fill_rounded_rect(
-    pixels: &mut [u8],
+    canvas: &mut Canvas,
     x: usize,
     y: usize,
     width: usize,
@@ -201,8 +255,8 @@ fn fill_rounded_rect(
     radius: usize,
     color: [u8; 4],
 ) {
-    let right = x.saturating_add(width).min(WIDTH);
-    let bottom = y.saturating_add(height).min(HEIGHT);
+    let right = x.saturating_add(width).min(canvas.width);
+    let bottom = y.saturating_add(height).min(canvas.height);
     let radius = radius.min(width / 2).min(height / 2);
     for row in y..bottom {
         for column in x..right {
@@ -217,28 +271,51 @@ fn fill_rounded_rect(
                 row.saturating_sub(bottom.saturating_sub(radius + 1))
             };
             if dx == 0 || dy == 0 || dx * dx + dy * dy <= radius * radius {
-                set_pixel(pixels, column, row, color);
+                set_pixel(canvas, column, row, color);
             }
         }
     }
 }
 
-fn horizontal(pixels: &mut [u8], left: usize, right: usize, y: usize, color: [u8; 4]) {
-    for x in left..=right.min(WIDTH - 1) {
-        set_pixel(pixels, x, y, color);
+fn horizontal(canvas: &mut Canvas, left: usize, right: usize, y: usize, color: [u8; 4]) {
+    for x in left..=right.min(canvas.width - 1) {
+        set_pixel(canvas, x, y, color);
     }
 }
 
-fn set_pixel(pixels: &mut [u8], x: usize, y: usize, rgba: [u8; 4]) {
-    if x >= WIDTH || y >= HEIGHT {
+fn set_pixel(canvas: &mut Canvas, x: usize, y: usize, rgba: [u8; 4]) {
+    if x >= canvas.width || y >= canvas.height {
         return;
     }
-    let offset = (y * WIDTH + x) * 4;
+    let offset = (y * canvas.width + x) * 4;
     let alpha = u16::from(rgba[3]);
-    pixels[offset..offset + 4].copy_from_slice(&[
+    canvas.pixels[offset..offset + 4].copy_from_slice(&[
         (u16::from(rgba[2]) * alpha / 255) as u8,
         (u16::from(rgba[1]) * alpha / 255) as u8,
         (u16::from(rgba[0]) * alpha / 255) as u8,
         rgba[3],
     ]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scaled_render_matches_logical_size_times_scale() {
+        let preview = DragPreview::Waveform {
+            buckets: vec![(-0.5, 0.5); 32],
+        };
+        let canvas = render_scaled(&preview, 1.5);
+        assert_eq!((canvas.width, canvas.height), (336, 135));
+        assert_eq!(canvas.pixels.len(), 336 * 135 * 4);
+        assert_eq!(
+            render_scaled(&preview, 1.0).pixels.len(),
+            WIDTH * HEIGHT * 4
+        );
+        // Corner stays transparent, border stays opaque at every scale.
+        assert_eq!(canvas.pixels[3], 0);
+        let mid_left = (canvas.height / 2 * canvas.width) * 4 + 3;
+        assert_eq!(canvas.pixels[mid_left], 255);
+    }
 }
