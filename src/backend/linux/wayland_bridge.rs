@@ -372,6 +372,9 @@ impl BridgeState {
             icon.as_ref().map(|icon| &icon.surface),
             0,
         );
+        if let Some(icon) = &icon {
+            icon.show();
+        }
         self.active = Some(ActiveDrag {
             id,
             source,
@@ -460,6 +463,17 @@ struct DragIcon {
 }
 
 impl DragIcon {
+    fn show(&self) {
+        self.surface.attach(Some(self._buffer.wl_buffer()), 0, 0);
+        self.surface.damage_buffer(
+            0,
+            0,
+            crate::preview::WIDTH as i32,
+            crate::preview::HEIGHT as i32,
+        );
+        self.surface.commit();
+    }
+
     fn new(
         compositor: &WlCompositor,
         shm: &Shm,
@@ -480,14 +494,9 @@ impl DragIcon {
             )
             .map_err(|error| WaylandBridgeError::new(format!("drag icon failed: {error}")))?;
         canvas.copy_from_slice(&crate::preview::render(preview));
-        surface.attach(Some(buffer.wl_buffer()), 0, 0);
-        surface.damage_buffer(
-            0,
-            0,
-            crate::preview::WIDTH as i32,
-            crate::preview::HEIGHT as i32,
-        );
-        surface.commit();
+        // The buffer goes on in `show`, once start_drag has given the
+        // surface its icon role: a surface committed with content before
+        // it has a role breaks the drag on some compositors (Hyprland).
         Ok(Self {
             surface,
             _pool: pool,

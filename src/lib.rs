@@ -10,7 +10,7 @@ mod wayland;
 
 pub use file_payload::FileDragOffer;
 pub(crate) use file_payload::FileDragPayloadData;
-pub use preview::{DragPreview, MidiPreviewNote};
+pub use preview::{DragPreview, MidiPreviewNote, PREVIEW_HEIGHT, PREVIEW_WIDTH};
 pub use wayland::WaylandSourceReporter;
 
 #[cfg(all(target_family = "unix", not(target_os = "macos")))]

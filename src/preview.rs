@@ -26,6 +26,12 @@ pub enum DragPreview {
         /// Energy at `column * rows + row`, clamped to `0.0..=1.0` when drawn.
         energy: Vec<f32>,
     },
+    /// The whole thumbnail, drawn by the caller: premultiplied BGRA,
+    /// [`PREVIEW_WIDTH`] by [`PREVIEW_HEIGHT`], row by row.
+    Image {
+        /// `PREVIEW_WIDTH * PREVIEW_HEIGHT * 4` bytes.
+        pixels: Vec<u8>,
+    },
     /// Normalized piano-roll notes.
     Midi {
         /// Notes to draw in the source preview.
@@ -35,6 +41,9 @@ pub enum DragPreview {
 
 pub(crate) const WIDTH: usize = 224;
 pub(crate) const HEIGHT: usize = 90;
+/// The logical size of a drag thumbnail, in pixels.
+pub const PREVIEW_WIDTH: usize = WIDTH;
+pub const PREVIEW_HEIGHT: usize = HEIGHT;
 
 /// Premultiplied BGRA pixels for one drag thumbnail.
 pub(crate) struct Canvas {
@@ -71,6 +80,19 @@ pub(crate) fn render_scaled(preview: &DragPreview, scale: f32) -> Canvas {
         pixels: vec![0_u8; width * height * 4],
         scale,
     };
+    if let DragPreview::Image { pixels } = preview {
+        // Nearest neighbour to the backing scale; a short image stays clear.
+        for y in 0..height {
+            for x in 0..width {
+                let (sx, sy) = ((x * WIDTH / width).min(WIDTH - 1), (y * HEIGHT / height).min(HEIGHT - 1));
+                let from = (sy * WIDTH + sx) * 4;
+                if let Some(px) = pixels.get(from..from + 4) {
+                    canvas.pixels[(y * width + x) * 4..][..4].copy_from_slice(px);
+                }
+            }
+        }
+        return canvas;
+    }
     let radius = canvas.px(12);
     let (sx, sy) = (canvas.px(3), canvas.px(4));
     fill_rounded_rect(
@@ -110,6 +132,7 @@ pub(crate) fn render_scaled(preview: &DragPreview, scale: f32) -> Canvas {
             energy,
         } => spectral(&mut canvas, *columns, *rows, energy),
         DragPreview::Midi { notes } => midi(&mut canvas, notes),
+        DragPreview::Image { .. } => {}
     }
     canvas
 }
@@ -300,6 +323,16 @@ fn set_pixel(canvas: &mut Canvas, x: usize, y: usize, rgba: [u8; 4]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_image_is_the_whole_thumbnail() {
+        let mut pixels = vec![0_u8; WIDTH * HEIGHT * 4];
+        pixels[..4].copy_from_slice(&[1, 2, 3, 255]);
+        let preview = DragPreview::Image { pixels: pixels.clone() };
+        assert_eq!(render_scaled(&preview, 1.0).pixels, pixels);
+        let big = render_scaled(&preview, 2.0);
+        assert_eq!(&big.pixels[..8], &[1, 2, 3, 255, 1, 2, 3, 255]);
+    }
 
     #[test]
     fn scaled_render_matches_logical_size_times_scale() {
