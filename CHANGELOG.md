@@ -2,6 +2,22 @@
 
 ## 0.1.6 - Unreleased
 
+- Add validated bitmap previews with separate backing dimensions, logical size, and cursor hotspot.
+- Isolate XDND target visits with fresh source identities, expire unanswered status/drop exchanges, and preserve release-coordinate snapshots.
+- Render X11 previews using verified native pixel layouts, compositor-aware alpha, and input-transparent shaped fallbacks.
+- Retry failed Wayland worker initialization, interrupt abandoned setup, and handle socket backpressure without blocking command dispatch.
+- Keep Windows previews in physical desktop coordinates and rerasterize only when their monitor DPI changes.
+- Register AppKit source classes per loaded binary image and retain callback code for the Objective-C class lifetime.
+- Add editor teardown cancellation that retires each outbound session once and ignores late events.
+- Run Xvfb protocol regressions and native Windows/AppKit geometry and lifetime fixtures on standard hosted CI runners.
+- Negotiate XDND versions 3–5, honor older completion messages, and accept only copy status messages addressed to the source with the required 32-bit format.
+- Convert macOS thumbnail pixels to premultiplied RGBA and place dragging frames in the initiating view's coordinate system.
+- Preserve Unix filename bytes when building file URIs, including filenames that are not UTF-8.
+- Update the Windows source thumbnail from OLE's drag-over feedback callback as well as button/key-state callbacks.
+- Serialize XDND position/status exchanges so release cannot reuse acceptance from an older pointer position, and make X11 thumbnails input-transparent.
+- Keep Wayland payload writes nonblocking and bounded on the shared worker, cancel timed-out queued starts, and avoid reporting export success before a payload transfer completes.
+- Return AppKit nil starts as normal native failures without retaining a rejected source, and restore every non-null Windows DPI context, including the unaware context.
+
 - Check only the protocol a native runtime reports at start. The built-in AppKit and OLE runtimes cannot tell a detached editor from an embedded one, so every drag from a standalone macOS app failed as `NativeRejected` after AppKit had already begun it.
 - Preserve the X11 source gesture through Hyprland's native Wayland bridge so a completed XWayland drop always releases the editor and later drags keep working.
 - Keep the Windows source thumbnail visible and anchored across DAW drop targets that do not implement the Shell target helper.

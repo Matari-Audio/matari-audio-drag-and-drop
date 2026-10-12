@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
+use percent_encoding::{AsciiSet, CONTROLS, percent_encode};
 
 const URI_ESCAPE: &AsciiSet = &CONTROLS
     .add(b' ')
@@ -163,18 +163,35 @@ pub fn plain_file_list(paths: &[PathBuf]) -> Vec<u8> {
 /// Convert a path to a percent-encoded `file://` URI.
 #[must_use]
 pub fn file_uri(path: &Path) -> String {
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStrExt;
+    #[cfg(not(unix))]
     let path = path.to_string_lossy();
+    #[cfg(not(unix))]
+    let path = path.as_bytes();
+    #[cfg(unix)]
+    let path = path.as_os_str().as_bytes();
     let mut uri = String::from("file://");
-    if !path.starts_with('/') {
+    if !path.starts_with(b"/") {
         uri.push('/');
     }
-    uri.push_str(&utf8_percent_encode(&path, URI_ESCAPE).to_string());
+    uri.push_str(&percent_encode(path, URI_ESCAPE).to_string());
     uri
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn file_uri_preserves_non_utf8_filename_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+        let path = PathBuf::from(std::ffi::OsString::from_vec(
+            b"/tmp/kick-\xff #%.wav".to_vec(),
+        ));
+        assert_eq!(file_uri(&path), "file:///tmp/kick-%FF%20%23%25.wav");
+    }
 
     #[test]
     fn file_offers_include_uri_and_plain_payloads() {

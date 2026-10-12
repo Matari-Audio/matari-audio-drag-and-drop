@@ -3,7 +3,8 @@
 //! Integrations own one [`Controller`] per editor and implement
 //! [`ToolkitAdapter`] at their live window callback. Native protocol runtimes
 //! consume owned start tickets and report lifecycle events back to that
-//! controller; no process-global queue or compatibility bridge is involved.
+//! controller. Toolkit adapters retain the queued ticket until a valid native
+//! callback can start it; Linux runtimes may share an event-loop worker.
 
 use std::error::Error;
 use std::ffi::c_void;
@@ -25,7 +26,7 @@ use raw_window_handle::{
 #[derive(Debug)]
 pub struct FileSet {
     paths: Box<[PathBuf]>,
-    preview: Option<crate::DragPreview>,
+    preview: Option<Box<crate::DragPreview>>,
 }
 
 impl FileSet {
@@ -66,7 +67,7 @@ impl FileSet {
     /// Attach source-side preview data to the file set.
     #[must_use]
     pub fn with_preview(mut self, preview: crate::DragPreview) -> Self {
-        self.preview = Some(preview);
+        self.preview = Some(Box::new(preview));
         self
     }
 
@@ -90,7 +91,7 @@ impl FileSet {
     /// Source-side preview data, when supplied by the application.
     #[must_use]
     pub fn preview(&self) -> Option<&crate::DragPreview> {
-        self.preview.as_ref()
+        self.preview.as_deref()
     }
 
     /// Consume the validated paths.
@@ -100,7 +101,7 @@ impl FileSet {
     }
 
     pub(crate) fn into_parts(self) -> (Vec<PathBuf>, Option<crate::DragPreview>) {
-        (self.paths.into_vec(), self.preview)
+        (self.paths.into_vec(), self.preview.map(|preview| *preview))
     }
 }
 
@@ -379,7 +380,7 @@ pub enum LinuxOutcome {
     Failed(LinuxFailure),
     /// The user or protocol cancelled the transfer.
     Cancelled,
-    /// Data was transferred, but the target never confirmed its final action.
+    /// A drop was sent, but the target never confirmed its final action.
     Indeterminate,
 }
 
@@ -890,9 +891,13 @@ impl DragOrigin<'_> {
     ///
     /// # Safety
     ///
-    /// `event` must be a live `NSEvent` from the same AppKit main-thread
-    /// callback and editor as `window`, and remain valid until
-    /// [`StartTicket::start`] returns.
+    /// `event` must be the live initiating mouse-down `NSEvent` for this
+    /// editor's current primary-button gesture, retained until
+    /// [`StartTicket::start`] returns. The toolkit must start on the AppKit
+    /// main thread in the originating view's mouse-down or mouse-dragged
+    /// callback, and must reject a gesture whose button was released, cancelled,
+    /// or whose source view/window closed. Retaining an event alone does not
+    /// retain gesture authority; an application-global last event is insufficient.
     pub unsafe fn with_appkit_event<W>(
         window: &W,
         event: NonNull<c_void>,
@@ -1385,6 +1390,24 @@ impl Controller {
         }
     }
 
+    /// Retire the editor's active outbound session on authoritative teardown.
+    /// Native adapters must also cancel/release their owned native resources.
+    /// Late native or ticket events for the retired session are ignored.
+    pub fn cancel_outbound(&mut self) {
+        self.drain_events();
+        if let Some(active) = self.active_outbound.take() {
+            self.pending.push(SessionEvent::OutboundTerminal {
+                session: active.session,
+                outcome: Outcome::Failed(SessionFailure {
+                    stage: FailureStage::Adapter,
+                    kind: FailureKind::AdapterAbandoned,
+                    native_code: None,
+                    native_effect: None,
+                }),
+            });
+        }
+    }
+
     /// Begin one outbound file-backed session.
     pub fn start_outbound<A: ToolkitAdapter>(
         &mut self,
@@ -1471,11 +1494,15 @@ impl Controller {
 
     /// Drain owned events reported by this controller's protocol runtimes.
     pub fn update(&mut self) -> Update {
-        while let Ok(event) = self.events_rx.try_recv() {
-            self.accept_ticket_event(event);
-        }
+        self.drain_events();
         Update {
             events: std::mem::take(&mut self.pending).into_boxed_slice(),
+        }
+    }
+
+    fn drain_events(&mut self) {
+        while let Ok(event) = self.events_rx.try_recv() {
+            self.accept_ticket_event(event);
         }
     }
 
@@ -1817,6 +1844,36 @@ mod tests {
     fn own_files() -> FileSet {
         FileSet::try_from_paths([std::env::current_exe().expect("test binary path")])
             .expect("test binary is a readable file")
+    }
+
+    #[test]
+    fn teardown_retires_once_and_late_ticket_drop_cannot_cancel_a_new_session() {
+        let mut controller = Controller::new();
+        let mut adapter = stub();
+        let retired = controller
+            .start_outbound(&mut adapter, own_files())
+            .expect("first session");
+        let old_ticket = adapter.scheduled.take().expect("queued ticket");
+        controller.cancel_outbound();
+        controller.cancel_outbound();
+        assert!(matches!(
+            controller.update().events(),
+            [SessionEvent::OutboundTerminal {
+                session,
+                outcome: Outcome::Failed(SessionFailure {
+                    stage: FailureStage::Adapter,
+                    kind: FailureKind::AdapterAbandoned,
+                    ..
+                }),
+            }] if *session == retired
+        ));
+        let current = controller
+            .start_outbound(&mut adapter, own_files())
+            .expect("new session after teardown");
+        drop(old_ticket);
+        assert!(controller.update().events().is_empty());
+        assert_eq!(controller.active_outbound(), Some(current));
+        assert!(controller.outbound_in_flight());
     }
 
     #[test]
