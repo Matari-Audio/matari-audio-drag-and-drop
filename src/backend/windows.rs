@@ -13,7 +13,7 @@ use windows::Win32::Foundation::{
 use windows::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
     CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, HBITMAP, HDC,
-    SelectObject,
+    HGDIOBJ, SelectObject,
 };
 use windows::Win32::System::Com::{
     DATADIR_GET, DVASPECT_CONTENT, FORMATETC, IAdviseSink, IDataObject, IDataObject_Impl,
@@ -27,17 +27,17 @@ use windows::Win32::System::Ole::{
 };
 use windows::Win32::System::SystemServices::{MK_LBUTTON, MODIFIERKEYS_FLAGS};
 use windows::Win32::UI::HiDpi::{
-    DPI_AWARENESS_CONTEXT, GetDpiForWindow, GetWindowDpiAwarenessContext,
+    DPI_AWARENESS_CONTEXT, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE, GetDpiForWindow,
     SetThreadDpiAwarenessContext,
 };
 use windows::Win32::UI::Shell::{
     CFSTR_FILENAMEW, CFSTR_PREFERREDDROPEFFECT, DROPFILES, SHCreateStdEnumFmtEtc,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, GetCursorPos, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOSIZE,
-    SWP_SHOWWINDOW, SetWindowPos, ULW_ALPHA, USER_DEFAULT_SCREEN_DPI, UpdateLayeredWindow,
-    WS_DISABLED, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_EX_TRANSPARENT, WS_POPUP,
+    CreateWindowExW, DestroyWindow, GetPhysicalCursorPos, HWND_TOPMOST, IsWindow, SWP_NOACTIVATE,
+    SWP_NOSIZE, SWP_SHOWWINDOW, SetWindowPos, ULW_ALPHA, UPDATE_LAYERED_WINDOW_FLAGS,
+    USER_DEFAULT_SCREEN_DPI, UpdateLayeredWindow, WS_DISABLED, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::implement;
 use windows_core::{BOOL, HRESULT, IUnknown, PCWSTR, Ref, Result};
@@ -93,7 +93,11 @@ pub(super) fn start_external_file_drag(
                     None
                 }
             });
-    let drop_source: IDropSource = FileDropSource { drag_image }.into();
+    let drop_source: IDropSource = FileDropSource {
+        drag_image,
+        owner: hwnd,
+    }
+    .into();
     let mut effect = DROPEFFECT(0);
     // SAFETY: OLE is initialized on this GUI thread, both COM interfaces remain
     // alive for the call, and `effect` is a writable `DROPEFFECT`.
@@ -109,6 +113,10 @@ pub(super) fn start_external_file_drag(
                 "Windows OLE DoDragDrop failed for {hwnd:?}: {err}"
             ))
         })?;
+        // OLE has returned and released its borrowed interfaces. Destroy our
+        // native preview before any terminal wake can reveal the source ghost.
+        drop(drop_source);
+        drop(data_object);
         if let Some(reporter) = &reporter {
             let outcome = if result == DRAGDROP_S_DROP && effect.0 & DROPEFFECT_COPY.0 != 0 {
                 Outcome::Copied
@@ -140,52 +148,32 @@ impl Drop for DragBitmapGuard {
     }
 }
 
-/// Source-side drag thumbnail: a layered top-level window that follows the
-/// cursor at the same offset as the in-app chip.
-///
-/// The Shell `IDragSourceHelper` only draws when the drop target calls
-/// `IDropTargetHelper` (Explorer does; DAWs mostly do not), and the legacy
-/// `ImageList_DragMove` path paints a fixed-size, ~75% alpha image straight on
-/// the screen DC, which is what users saw as "translucent, wrong size, jumps
-/// to the corner". A layered window owned by us is composited by DWM, keeps
-/// full alpha, and is sized at the plugin window's DPI.
+/// One independently per-monitor-aware layered window. The system STATIC
+/// class requires no callback into plugin code. Position APIs always run in a
+/// scoped physical desktop context, regardless of the host/editor awareness.
 struct SourceDragImage {
     hwnd: HWND,
-    _bitmap: DragBitmapGuard,
-    context: DPI_AWARENESS_CONTEXT,
-    offset: POINT,
+    preview: DragPreview,
+    state: Mutex<DragImageState>,
 }
 
-/// In-app chip offset from the cursor, in logical pixels
-/// (`src/export/drag.rs` `CHIP_OFFSET` on the BUFFR side).
-const CHIP_OFFSET: (f32, f32) = (20.0, 22.0);
+struct DragImageState {
+    bitmap: Option<DragBitmapGuard>,
+    dpi: u32,
+    hotspot: [i32; 2],
+}
 
 impl SourceDragImage {
-    fn new(preview: &DragPreview, owner: HWND) -> std::result::Result<Self, PreviewAttachError> {
-        // SAFETY: `owner` is the live plugin window this drag started from.
-        let context = unsafe { GetWindowDpiAwarenessContext(owner) };
-        let _dpi = ThreadDpiContext::enter(context);
-        // SAFETY: `owner` is a live window; a zero result means "unaware".
-        let dpi = unsafe { GetDpiForWindow(owner) };
-        let scale = if dpi == 0 {
-            1.0
-        } else {
-            dpi as f32 / USER_DEFAULT_SCREEN_DPI as f32
-        };
-        let canvas = crate::preview::render_scaled(preview, scale);
-        let bitmap = DragBitmapGuard(
-            create_drag_bitmap(&canvas.pixels, canvas.width, canvas.height)
-                .map_err(|_| PreviewAttachError::new(PreviewFailureStage::Bitmap, None))?,
-        );
-        let offset = POINT {
-            x: (CHIP_OFFSET.0 * scale).round() as i32,
-            y: (CHIP_OFFSET.1 * scale).round() as i32,
-        };
-        let mut cursor = POINT::default();
-        // SAFETY: `cursor` is a writable `POINT`.
-        let _ = unsafe { GetCursorPos(&mut cursor) };
-        // SAFETY: "STATIC" is a system window class, all pointer arguments are
-        // null, and the window is destroyed in `Drop`.
+    fn new(preview: &DragPreview, _owner: HWND) -> std::result::Result<Self, PreviewAttachError> {
+        preview
+            .validate()
+            .map_err(|_| PreviewAttachError::new(PreviewFailureStage::Bitmap, None))?;
+        let _dpi = ThreadDpiContext::physical()?;
+        let cursor = physical_cursor()?;
+        // A hidden one-pixel top-level on the cursor monitor lets Windows
+        // supply actual effective DPI even in an unaware/system-aware host.
+        // SAFETY: System STATIC class, no image-local WNDPROC, and scoped
+        // per-monitor awareness; the owned window is destroyed on all failures.
         let hwnd = unsafe {
             CreateWindowExW(
                 WS_EX_LAYERED
@@ -196,10 +184,10 @@ impl SourceDragImage {
                 windows_core::w!("STATIC"),
                 PCWSTR::null(),
                 WS_POPUP | WS_DISABLED,
-                cursor.x + offset.x,
-                cursor.y + offset.y,
-                canvas.width as i32,
-                canvas.height as i32,
+                cursor.x,
+                cursor.y,
+                1,
+                1,
                 None,
                 None,
                 None,
@@ -211,82 +199,223 @@ impl SourceDragImage {
         })?;
         let image = Self {
             hwnd,
-            _bitmap: bitmap,
-            context,
-            offset,
+            preview: preview.clone(),
+            state: Mutex::new(DragImageState {
+                bitmap: None,
+                dpi: 0,
+                hotspot: [0, 0],
+            }),
         };
-        // SAFETY: `hwnd` is the layered window created above and the DIB is
-        // alive for the whole call; the memory DC is released before return.
+        // SAFETY: Query our own live, per-monitor-aware window.
+        let dpi = unsafe { GetDpiForWindow(hwnd) };
+        if dpi == 0 {
+            return Err(PreviewAttachError::new(PreviewFailureStage::Helper, None));
+        }
+        {
+            let mut state = image
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            image.rasterize(dpi, cursor, &mut state)?;
+        }
+        // Upload/position happened while hidden. This is the sole show;
+        // ordinary OLE movement never changes visibility or activation.
+        // SAFETY: Prepared live layered window, physical desktop coordinates.
         unsafe {
-            let source = CreateCompatibleDC(None);
-            let previous = SelectObject(source, image._bitmap.0.into());
-            let size = SIZE {
-                cx: canvas.width as i32,
-                cy: canvas.height as i32,
-            };
-            let origin = POINT::default();
-            let blend = BLENDFUNCTION {
-                BlendOp: AC_SRC_OVER as u8,
-                BlendFlags: 0,
-                SourceConstantAlpha: 255,
-                AlphaFormat: AC_SRC_ALPHA as u8,
-            };
-            let result = UpdateLayeredWindow(
+            SetWindowPos(
                 hwnd,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOSIZE
+                    | windows::Win32::UI::WindowsAndMessaging::SWP_NOMOVE
+                    | SWP_NOACTIVATE
+                    | SWP_SHOWWINDOW,
+            )
+        }
+        .map_err(|error| {
+            PreviewAttachError::new(PreviewFailureStage::Attach, Some(error.code().0))
+        })?;
+        Ok(image)
+    }
+
+    fn rasterize(
+        &self,
+        dpi: u32,
+        cursor: POINT,
+        state: &mut DragImageState,
+    ) -> std::result::Result<(), PreviewAttachError> {
+        let canvas = crate::preview::render_scaled(
+            &self.preview,
+            dpi as f32 / USER_DEFAULT_SCREEN_DPI as f32,
+        )
+        .map_err(|_| PreviewAttachError::new(PreviewFailureStage::Bitmap, None))?;
+        let bitmap = DragBitmapGuard(
+            create_drag_bitmap(&canvas.pixels, canvas.width, canvas.height)
+                .map_err(|_| PreviewAttachError::new(PreviewFailureStage::Bitmap, None))?,
+        );
+        let dc = BitmapDc::new(bitmap.0)?;
+        let size = SIZE {
+            cx: i32::try_from(canvas.width)
+                .map_err(|_| PreviewAttachError::new(PreviewFailureStage::Bitmap, None))?,
+            cy: i32::try_from(canvas.height)
+                .map_err(|_| PreviewAttachError::new(PreviewFailureStage::Bitmap, None))?,
+        };
+        let position = image_position(cursor, canvas.hotspot);
+        let origin = POINT::default();
+        let blend = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            BlendFlags: 0,
+            SourceConstantAlpha: 255,
+            AlphaFormat: AC_SRC_ALPHA as u8,
+        };
+        // Atomic content/size/position update: retain the previous bitmap and
+        // geometry if allocating or uploading the replacement fails.
+        // SAFETY: Live owned window and DIB, valid selected memory DC; all
+        // coordinates/dimensions use the scoped physical desktop context.
+        unsafe {
+            UpdateLayeredWindow(
+                self.hwnd,
                 None,
-                None,
+                Some(&position),
                 Some(&size),
-                Some(source),
+                Some(dc.dc),
                 Some(&origin),
                 COLORREF(0),
                 Some(&blend),
                 ULW_ALPHA,
-            );
-            SelectObject(source, previous);
-            let _ = DeleteDC(source);
-            result.map_err(|error| {
-                PreviewAttachError::new(PreviewFailureStage::Attach, Some(error.code().0))
-            })?;
+            )
         }
-        image.move_to_cursor();
-        Ok(image)
+        .map_err(|error| {
+            PreviewAttachError::new(PreviewFailureStage::Attach, Some(error.code().0))
+        })?;
+        // Deselect before replacing/dropping either bitmap.
+        drop(dc);
+        state.bitmap = Some(bitmap);
+        state.dpi = dpi;
+        state.hotspot = canvas.hotspot;
+        Ok(())
     }
 
     fn move_to_cursor(&self) {
-        let _dpi = ThreadDpiContext::enter(self.context);
-        let mut cursor = POINT::default();
-        // SAFETY: `cursor` is a writable `POINT` and `hwnd` is alive until `Drop`.
-        unsafe {
-            if GetCursorPos(&mut cursor).is_ok() {
-                let _ = SetWindowPos(
-                    self.hwnd,
-                    Some(HWND_TOPMOST),
-                    cursor.x + self.offset.x,
-                    cursor.y + self.offset.y,
-                    0,
-                    0,
-                    SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
-                );
-            }
+        let Ok(_dpi) = ThreadDpiContext::physical() else {
+            return;
+        };
+        let Ok(cursor) = physical_cursor() else {
+            return;
+        };
+        // A native API can cause reentrant callbacks; the last good image is
+        // already visible, so skip that nested update rather than deadlock.
+        let Ok(mut state) = self.state.try_lock() else {
+            return;
+        };
+        let position = image_position(cursor, state.hotspot);
+        // SAFETY: Position-only layered update retains the uploaded content,
+        // dimensions and visibility; source DC/size/blend are all NULL.
+        if unsafe {
+            UpdateLayeredWindow(
+                self.hwnd,
+                None,
+                Some(&position),
+                None,
+                None,
+                None,
+                COLORREF(0),
+                None,
+                UPDATE_LAYERED_WINDOW_FLAGS(0),
+            )
+        }
+        .is_err()
+        {
+            return;
+        }
+        // GetDpiForWindow follows the preview's actual monitor, not the source
+        // HWND's frozen/virtualized DPI. Cosmetic failure leaves old content
+        // and anchor intact, and the next callback retries the transition.
+        // SAFETY: Our per-monitor-aware window remains live for the drag.
+        let dpi = unsafe { GetDpiForWindow(self.hwnd) };
+        if dpi != 0 && dpi != state.dpi {
+            let _ = self.rasterize(dpi, cursor, &mut state);
         }
     }
 }
 
 impl Drop for SourceDragImage {
     fn drop(&mut self) {
-        // SAFETY: This struct uniquely owns the window it created.
+        // SAFETY: Unique ownership; system WNDPROC has no plugin lifetime.
         unsafe {
             let _ = DestroyWindow(self.hwnd);
         }
     }
 }
 
-/// Runs cursor and window calls in the plugin window's DPI awareness context
-/// so `GetCursorPos`, `GetDpiForWindow` and `SetWindowPos` agree on one
-/// coordinate space, whatever the host process default is.
+fn physical_cursor() -> std::result::Result<POINT, PreviewAttachError> {
+    let mut cursor = POINT::default();
+    // SAFETY: Writable POINT, no input injection or pointer modification.
+    unsafe { GetPhysicalCursorPos(&mut cursor) }.map_err(|error| {
+        PreviewAttachError::new(PreviewFailureStage::Helper, Some(error.code().0))
+    })?;
+    Ok(cursor)
+}
+
+fn image_position(cursor: POINT, hotspot: [i32; 2]) -> POINT {
+    POINT {
+        x: cursor.x.saturating_sub(hotspot[0]),
+        y: cursor.y.saturating_sub(hotspot[1]),
+    }
+}
+
+struct BitmapDc {
+    dc: HDC,
+    previous: HGDIOBJ,
+}
+
+impl BitmapDc {
+    fn new(bitmap: HBITMAP) -> std::result::Result<Self, PreviewAttachError> {
+        // SAFETY: Null creates a screen-compatible memory DC owned here.
+        let dc = unsafe { CreateCompatibleDC(None) };
+        if dc.0.is_null() {
+            return Err(PreviewAttachError::last(PreviewFailureStage::Helper));
+        }
+        // SAFETY: Live compatible DC and DIB, deselected in Drop.
+        let previous = unsafe { SelectObject(dc, bitmap.into()) };
+        if previous.0.is_null() || previous.0 as isize == -1 {
+            let error = PreviewAttachError::last(PreviewFailureStage::Helper);
+            // SAFETY: Our DC; no valid bitmap selection to undo.
+            unsafe {
+                let _ = DeleteDC(dc);
+            }
+            return Err(error);
+        }
+        Ok(Self { dc, previous })
+    }
+}
+
+impl Drop for BitmapDc {
+    fn drop(&mut self) {
+        // SAFETY: Restore the live previous object before deleting our DC.
+        unsafe {
+            SelectObject(self.dc, self.previous);
+            let _ = DeleteDC(self.dc);
+        }
+    }
+}
+
+/// Scoped thread awareness; never changes the process/host default.
 struct ThreadDpiContext(DPI_AWARENESS_CONTEXT);
 
 impl ThreadDpiContext {
+    fn physical() -> std::result::Result<Self, PreviewAttachError> {
+        let context = Self::enter(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE);
+        if context.0.0.is_null() {
+            Err(PreviewAttachError::last(PreviewFailureStage::Helper))
+        } else {
+            Ok(context)
+        }
+    }
+
     fn enter(context: DPI_AWARENESS_CONTEXT) -> Self {
         // SAFETY: Thread-local state change, restored in `Drop`.
         Self(unsafe { SetThreadDpiAwarenessContext(context) })
@@ -295,7 +424,8 @@ impl ThreadDpiContext {
 
 impl Drop for ThreadDpiContext {
     fn drop(&mut self) {
-        if !self.0.is_invalid() {
+        // `-1` is the valid UNAWARE context; only NULL means the switch failed.
+        if !self.0.0.is_null() {
             // SAFETY: Restores the context saved in `enter` on the same thread.
             unsafe {
                 SetThreadDpiAwarenessContext(self.0);
@@ -304,12 +434,148 @@ impl Drop for ThreadDpiContext {
     }
 }
 
+#[cfg(test)]
+mod dpi_tests {
+    use super::*;
+    use windows::Win32::UI::HiDpi::{
+        AreDpiAwarenessContextsEqual, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE,
+        DPI_AWARENESS_CONTEXT_UNAWARE, GetThreadDpiAwarenessContext,
+    };
+
+    #[test]
+    fn dpi_guard_restores_unaware_pseudohandle() {
+        let original = ThreadDpiContext::enter(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE);
+        assert!(!original.0.0.is_null());
+
+        drop(ThreadDpiContext(DPI_AWARENESS_CONTEXT_UNAWARE));
+
+        // SAFETY: Both values are valid contexts; the guard changes only this thread.
+        assert!(unsafe {
+            AreDpiAwarenessContextsEqual(
+                GetThreadDpiAwarenessContext(),
+                DPI_AWARENESS_CONTEXT_UNAWARE,
+            )
+            .as_bool()
+        });
+    }
+
+    #[test]
+    fn physical_preview_preserves_unaware_host_and_last_good_raster() {
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, IsWindowVisible};
+
+        let original = ThreadDpiContext::enter(DPI_AWARENESS_CONTEXT_UNAWARE);
+        assert!(!original.0.0.is_null());
+        let preview = DragPreview::Bitmap(
+            crate::DragImage::new(4, 3, vec![255; 4 * 3 * 4])
+                .unwrap()
+                .with_geometry([40.0, 30.0], [7.0, 11.0])
+                .unwrap(),
+        );
+        let image = SourceDragImage::new(&preview, HWND::default()).expect("native preview attach");
+        assert!(
+            // SAFETY: Valid context/window; no cursor movement or input injection.
+            unsafe {
+                AreDpiAwarenessContextsEqual(
+                    GetThreadDpiAwarenessContext(),
+                    DPI_AWARENESS_CONTEXT_UNAWARE,
+                )
+            }
+            .as_bool()
+        );
+        // SAFETY: Live owned preview HWND.
+        assert!(unsafe { IsWindowVisible(image.hwnd) }.as_bool());
+        {
+            let _physical = ThreadDpiContext::physical().unwrap();
+            let mut state = image.state.lock().unwrap();
+            // Exercise a real native reupload to a negative physical desktop
+            // point at 200% scale. This doesn't claim a physical two-monitor test.
+            image
+                .rasterize(192, POINT { x: -120, y: -80 }, &mut state)
+                .unwrap();
+            let mut rect = RECT::default();
+            // SAFETY: Live HWND and writable native RECT in physical context.
+            unsafe { GetWindowRect(image.hwnd, &mut rect) }.unwrap();
+            assert_eq!(
+                (
+                    rect.left,
+                    rect.top,
+                    rect.right - rect.left,
+                    rect.bottom - rect.top
+                ),
+                (-134, -102, 80, 60)
+            );
+            assert_eq!(state.hotspot, [14, 22]);
+            let bitmap = state.bitmap.as_ref().unwrap().0;
+            // Fail the replacement upload after constructing its raster/DC.
+            // SAFETY: We own the HWND; no drag/modal callbacks exist in this test.
+            unsafe { DestroyWindow(image.hwnd) }.unwrap();
+            assert!(image.rasterize(144, POINT::default(), &mut state).is_err());
+            assert_eq!(state.dpi, 192);
+            assert_eq!(state.bitmap.as_ref().unwrap().0, bitmap);
+            assert_eq!(state.hotspot, [14, 22]);
+        }
+        assert!(
+            // SAFETY: Scoped preview API calls must restore the original unaware host.
+            unsafe {
+                AreDpiAwarenessContextsEqual(
+                    GetThreadDpiAwarenessContext(),
+                    DPI_AWARENESS_CONTEXT_UNAWARE,
+                )
+            }
+            .as_bool()
+        );
+    }
+
+    #[test]
+    fn lost_source_window_cancels_the_native_loop() {
+        let source: IDropSource = FileDropSource {
+            owner: HWND::default(),
+            drag_image: None,
+        }
+        .into();
+        assert_eq!(
+            // SAFETY: Live source COM interface, no input injection or target use.
+            unsafe { source.QueryContinueDrag(false, MK_LBUTTON) },
+            DRAGDROP_S_CANCEL
+        );
+    }
+
+    #[test]
+    fn failed_dpi_switch_preserves_current_context() {
+        let original = ThreadDpiContext::enter(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE);
+        assert!(!original.0.0.is_null());
+
+        let failed = ThreadDpiContext::enter(DPI_AWARENESS_CONTEXT::default());
+        assert!(failed.0.0.is_null());
+        drop(failed);
+
+        // SAFETY: The current context and predefined comparison context are valid.
+        assert!(unsafe {
+            AreDpiAwarenessContextsEqual(
+                GetThreadDpiAwarenessContext(),
+                DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE,
+            )
+            .as_bool()
+        });
+    }
+}
+
+#[derive(Debug)]
 struct PreviewAttachError {
     stage: PreviewFailureStage,
     native_code: Option<i32>,
 }
 
 impl PreviewAttachError {
+    fn last(stage: PreviewFailureStage) -> Self {
+        // SAFETY: Read immediately after the failed Win32 operation.
+        Self::new(
+            stage,
+            Some(unsafe { windows::Win32::Foundation::GetLastError() }.0 as i32),
+        )
+    }
+
     fn new(stage: PreviewFailureStage, native_code: Option<i32>) -> Self {
         Self { stage, native_code }
     }
@@ -320,6 +586,17 @@ fn create_drag_bitmap(
     width: usize,
     height: usize,
 ) -> std::result::Result<HBITMAP, String> {
+    let bytes = width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(4));
+    if width == 0
+        || height == 0
+        || width > i32::MAX as usize
+        || height > i32::MAX as usize
+        || bytes != Some(rgba.len())
+    {
+        return Err("invalid drag bitmap dimensions or pixel length".into());
+    }
     // SAFETY: Zero is a valid initial state for `BITMAPINFO`; the required
     // header fields are initialized below before the GDI call.
     let mut info: BITMAPINFO = unsafe { zeroed() };
@@ -741,6 +1018,7 @@ fn registered_clipboard_format(name: PCWSTR) -> Option<u16> {
 
 #[implement(IDropSource)]
 struct FileDropSource {
+    owner: HWND,
     drag_image: Option<SourceDragImage>,
 }
 
@@ -750,7 +1028,8 @@ impl IDropSource_Impl for FileDropSource_Impl {
         if let Some(image) = &self.drag_image {
             image.move_to_cursor();
         }
-        if fescapepressed.as_bool() {
+        // SAFETY: IsWindow accepts stale HWND values; never dereferences plugin state.
+        if fescapepressed.as_bool() || !unsafe { IsWindow(Some(self.owner)) }.as_bool() {
             DRAGDROP_S_CANCEL
         } else if (grfkeystate.0 & MK_LBUTTON.0) == 0 {
             DRAGDROP_S_DROP
@@ -760,6 +1039,9 @@ impl IDropSource_Impl for FileDropSource_Impl {
     }
 
     fn GiveFeedback(&self, _dweffect: DROPEFFECT) -> HRESULT {
+        if let Some(image) = &self.drag_image {
+            image.move_to_cursor();
+        }
         DRAGDROP_S_USEDEFAULTCURSORS
     }
 }

@@ -12,8 +12,7 @@ Matari separates product decisions from native protocol work:
   Wayland data-device source for embedded XWayland editors on Hyprland.
 - `WaylandRuntimePort` consumes an event-scoped runtime that owns the
   toolkit's one-use press token and existing Wayland queue.
-- `SessionReporter` delivers native lifecycle events without polling, timers,
-  or process-global buses.
+- `SessionReporter` delivers native lifecycle events to the editor's controller.
 
 The package validates file-backed payloads before they reach a native runtime.
 Session IDs are direction-typed, outcomes and failures are explicit, and each
@@ -38,9 +37,14 @@ Hyprland uses its serial-less native Wayland compatibility route only when both
 the live X window manager and session identify Hyprland; unknown or unsupported
 bridges remain XDND-only. A live xwayland-satellite server overrides stale
 desktop labels because it does not bridge DND between X11 and native Wayland.
-XDND target discovery follows the X server's live child-under-pointer ancestry
-instead of reconstructing target placement from root-window rectangles. The
-route never infers completion from elapsed time.
+XDND target discovery translates the event's root-coordinate snapshot through
+the X server's window hierarchy. Adapters forward native events and call
+`X11Session::poll` periodically, including while no input events arrive. An
+unanswered status expires after two seconds; an unconfirmed drop expires after
+twenty seconds as `Indeterminate`. A deadline never establishes success.
+
+Each target visit has a distinct source identity, so a delayed reply from a
+previous visit or drag cannot authorize the current drop.
 
 Compositors without an X11-source to native-Wayland bridge cannot make an
 embedded XWayland editor drop into native Wayland targets. Those sessions need
@@ -49,6 +53,24 @@ available for X11/XWayland targets.
 
 Linux reporters distinguish successful export, target/compositor rejection,
 unsupported routes, and setup failure.
+
+## Preview geometry
+
+`DragImage::new(width, height, pixels)` validates premultiplied BGRA8 backing
+pixels and bounded dimensions. `with_geometry(logical_size, hotspot)` declares
+the displayed size and cursor offset in logical GUI units; backing resolution
+can differ from displayed size. Use `DragPreview::Bitmap(image)` with
+`FileSet::with_preview` to carry that contract through native rendering.
+
+Windows renders at the preview window's current monitor DPI in physical desktop
+coordinates. AppKit preserves backing pixels while sizing the image in points.
+X11 uses the native visual's channel masks and byte order, with composited ARGB
+when available and a shaped root-visual fallback otherwise.
+
+Admit one owned start ticket per mouse gesture. Start it after successful frame
+presentation, outside model borrows; AppKit requires the owning view's live drag
+callback. On editor teardown, release native resources and call
+`Controller::cancel_outbound`; late events cannot retire a newer session.
 
 ## Maturity
 

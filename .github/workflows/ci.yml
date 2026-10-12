@@ -3,6 +3,7 @@ name: CI
 on:
   pull_request:
   merge_group:
+  workflow_dispatch:
   push:
     branches: [main]
 permissions: {}
@@ -18,7 +19,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Wayland development files
-        run: sudo apt-get update && sudo apt-get install --yes libwayland-dev
+        run: sudo apt-get update && sudo apt-get install --yes libwayland-dev xvfb xauth
 
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
@@ -32,8 +33,17 @@ jobs:
       - name: Check
         run: cargo check --locked --all-features
 
+      - name: Tests
+        run: cargo test --locked --all-features
+
+      - name: XDND proxy routing
+        run: env -u WAYLAND_DISPLAY xvfb-run -a -s '-screen 0 1280x1024x24 -noreset' cargo test --locked --lib canonical_proxy_identity_and_child_replies_roundtrip -- --ignored --test-threads=1
+
+      - name: XDND protocol tests
+        run: env -u WAYLAND_DISPLAY xvfb-run -a -s '-screen 0 1280x1024x24 -noreset' cargo test --locked --test xdnd -- --ignored --test-threads=1
+
       - name: Clippy
-        run: cargo clippy --locked --lib --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks -D unsafe_op_in_unsafe_fn
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks -D unsafe_op_in_unsafe_fn
 
       - name: Rustdoc
         env:
@@ -58,7 +68,10 @@ jobs:
           toolchain: stable
 
       - name: Check Windows backend
-        run: cargo clippy --locked --lib --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks -D unsafe_op_in_unsafe_fn
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks -D unsafe_op_in_unsafe_fn
+
+      - name: Tests
+        run: cargo test --locked --all-features
 
   macos:
     name: macOS
@@ -74,8 +87,17 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Check macOS backend
-        run: cargo clippy --locked --lib --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks -D unsafe_op_in_unsafe_fn
+      - name: Check macOS backend and test fixtures
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks -D unsafe_op_in_unsafe_fn
+
+      - name: Tests
+        run: cargo test --locked --all-features
+
+      - name: Independent AppKit images
+        run: cargo build --locked --example appkit_image_a --example appkit_image_b
+
+      - name: AppKit geometry and independent image lifetimes
+        run: MATARI_APPKIT_IMAGES="$PWD/target/debug/examples/libappkit_image_a.dylib:$PWD/target/debug/examples/libappkit_image_b.dylib" cargo test --locked --test appkit_start
 
   msrv:
     name: Rust 1.95 MSRV

@@ -159,11 +159,13 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 name = "matari-audio-drag-and-drop"
 version = "0.1.6"
 dependencies = [
+ "libc",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
  "percent-encoding",
  "raw-window-handle",
+ "rustix",
  "smithay-client-toolkit",
  "wayland-client",
  "windows",
@@ -203,6 +205,7 @@ checksum = "d49e936b501e5c5bf01fda3a9452ff86dc3ea98ad5f283e1455153142d97518c"
 dependencies = [
  "bitflags",
  "objc2",
+ "objc2-core-foundation",
  "objc2-foundation",
 ]
 

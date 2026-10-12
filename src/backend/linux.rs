@@ -1,8 +1,10 @@
 use std::error::Error;
 use std::fmt;
+use std::time::{Duration, Instant};
 
 mod drop_router;
 mod mime;
+mod preview;
 mod wayland_bridge;
 
 use drop_router::OutboundGuard;
@@ -13,16 +15,18 @@ use crate::{
     PreviewFailureStage, PreviewStatus, SessionReporter, SessionRoute, SourceContext,
 };
 use mime::MimeTargets;
+use preview::PreviewWindow;
 use raw_window_handle::RawWindowHandle;
 use wayland_bridge::WaylandBridgeSession;
 use x11rb::CURRENT_TIME;
 use x11rb::connection::Connection;
-use x11rb::protocol::Event;
+use x11rb::errors::ReplyError;
 use x11rb::protocol::xproto::{
-    Atom, AtomEnum, ButtonReleaseEvent, ClientMessageEvent, ConfigureWindowAux, ConnectionExt,
-    CreateGCAux, CreateWindowAux, EventMask, Gcontext, GrabMode, GrabStatus, ImageFormat, PropMode,
-    SelectionNotifyEvent, SelectionRequestEvent, StackMode, Window as XWindow, WindowClass,
+    Atom, AtomEnum, ButtonReleaseEvent, ClientMessageEvent, ConnectionExt, CreateWindowAux,
+    EventMask, GrabMode, GrabStatus, PropMode, SelectionNotifyEvent, SelectionRequestEvent,
+    Window as XWindow, WindowClass,
 };
+use x11rb::protocol::{ErrorKind, Event};
 use x11rb::wrapper::ConnectionExt as _;
 
 const XDND_VERSION: u32 = 5;
@@ -233,6 +237,7 @@ pub type X11StartError = X11SessionError;
 struct XdndTarget {
     logical: XWindow,
     recipient: XWindow,
+    version: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -305,110 +310,6 @@ impl XdndAtoms {
             utf8_string: self.utf8_string,
             string: self.string,
         }
-    }
-}
-
-struct PreviewWindow {
-    window: XWindow,
-    gc: Gcontext,
-    depth: u8,
-    pixels: Vec<u8>,
-}
-
-impl PreviewWindow {
-    const OFFSET_X: i32 = 20;
-    const OFFSET_Y: i32 = 22;
-
-    fn new<C: Connection>(
-        conn: &C,
-        root: XWindow,
-        root_x: i16,
-        root_y: i16,
-        preview: &crate::DragPreview,
-    ) -> Result<Self, X11SessionError> {
-        let screen = conn
-            .setup()
-            .roots
-            .iter()
-            .find(|screen| screen.root == root)
-            .ok_or_else(|| X11SessionError::new("X11 drag root has no matching screen"))?;
-        let window = conn.generate_id().map_err(x11_error)?;
-        conn.create_window(
-            screen.root_depth,
-            window,
-            root,
-            -10_000,
-            -10_000,
-            crate::preview::WIDTH as u16,
-            crate::preview::HEIGHT as u16,
-            0,
-            WindowClass::INPUT_OUTPUT,
-            screen.root_visual,
-            &CreateWindowAux::new()
-                .override_redirect(1)
-                .background_pixel(0)
-                .event_mask(EventMask::EXPOSURE),
-        )
-        .map_err(x11_error)?;
-        let gc = conn.generate_id().map_err(x11_error)?;
-        if let Err(error) = conn.create_gc(gc, window, &CreateGCAux::new()) {
-            let _ = conn.destroy_window(window);
-            return Err(x11_error(error));
-        }
-        let preview = Self {
-            window,
-            gc,
-            depth: screen.root_depth,
-            pixels: crate::preview::render(preview),
-        };
-        if let Err(error) = conn.map_window(window).map_err(x11_error) {
-            preview.destroy(conn);
-            return Err(error);
-        }
-        if let Err(error) = preview.move_to(conn, root_x, root_y) {
-            preview.destroy(conn);
-            return Err(error);
-        }
-        Ok(preview)
-    }
-
-    fn move_to<C: Connection>(
-        &self,
-        conn: &C,
-        root_x: i16,
-        root_y: i16,
-    ) -> Result<(), X11SessionError> {
-        conn.configure_window(
-            self.window,
-            &ConfigureWindowAux::new()
-                .x(i32::from(root_x) + Self::OFFSET_X)
-                .y(i32::from(root_y) + Self::OFFSET_Y)
-                .stack_mode(StackMode::ABOVE),
-        )
-        .map_err(x11_error)?;
-        self.draw(conn)
-    }
-
-    fn draw<C: Connection>(&self, conn: &C) -> Result<(), X11SessionError> {
-        conn.put_image(
-            ImageFormat::Z_PIXMAP,
-            self.window,
-            self.gc,
-            crate::preview::WIDTH as u16,
-            crate::preview::HEIGHT as u16,
-            0,
-            0,
-            0,
-            self.depth,
-            &self.pixels,
-        )
-        .map_err(x11_error)?;
-        conn.flush().map_err(x11_error)
-    }
-
-    fn destroy<C: Connection>(self, conn: &C) {
-        let _ = conn.free_gc(self.gc);
-        let _ = conn.destroy_window(self.window);
     }
 }
 
@@ -501,7 +402,8 @@ impl X11Session {
         XdndSession::start(conn, source_window, files, reporter, press).map(|session| Self {
             inner: LinuxSession::Xdnd(Box::new(session)),
             route,
-            outbound: Some(OutboundGuard::register(Some(source_window))),
+            // XDND owns a registration for each native source epoch.
+            outbound: None,
         })
     }
 
@@ -521,6 +423,40 @@ impl X11Session {
         event: &Event,
     ) -> Result<X11SessionStatus, X11SessionError> {
         let status = self.drive(conn, event);
+        if !matches!(status, Ok(X11SessionStatus::Active)) || self.transfer_complete() {
+            self.outbound = None;
+        }
+        status
+    }
+
+    /// Advance protocol deadlines even when the X11 queue is idle.
+    ///
+    /// Call from the owning event loop's heartbeat (at least every 100 ms).
+    /// Missing Status cancels the drag after two seconds; a missing Finished
+    /// retires it after twenty seconds without reporting a successful import.
+    pub fn poll<C: Connection>(&mut self, conn: &C) -> Result<X11SessionStatus, X11SessionError> {
+        self.poll_at(conn, Instant::now())
+    }
+
+    /// Advance deadlines using a supplied monotonic clock instant.
+    ///
+    /// Event loops with a shared clock may pass their current instant here;
+    /// deterministic protocol tests can advance it without sleeping.
+    pub fn poll_at<C: Connection>(
+        &mut self,
+        conn: &C,
+        now: Instant,
+    ) -> Result<X11SessionStatus, X11SessionError> {
+        let status = match &mut self.inner {
+            LinuxSession::Xdnd(session) => session.poll_at(conn, now),
+            LinuxSession::Wayland { session, released } => {
+                Ok(if session.is_terminal() && *released {
+                    X11SessionStatus::Finished
+                } else {
+                    X11SessionStatus::Active
+                })
+            }
+        };
         if !matches!(status, Ok(X11SessionStatus::Active)) || self.transfer_complete() {
             self.outbound = None;
         }
@@ -649,9 +585,20 @@ struct XdndSession {
     atoms: XdndAtoms,
     root: XWindow,
     source_window: XWindow,
+    editor_window: XWindow,
+    source_windows: Vec<XWindow>,
+    source_guards: Vec<OutboundGuard>,
+    source_used: bool,
+    selection_time: u32,
     file_payload: FileDragPayloadData,
     current_target: Option<XdndTarget>,
     target_acceptance: TargetAcceptance,
+    awaiting_status: bool,
+    last_position: Option<(i16, i16)>,
+    queued_position: Option<(i16, i16, u32)>,
+    status_deadline: Option<Instant>,
+    finished_deadline: Option<Instant>,
+    position_deadline: Option<Instant>,
     released_target: Option<XdndTarget>,
     drop_target: Option<XdndTarget>,
     payload_target: Option<XWindow>,
@@ -674,17 +621,25 @@ impl fmt::Debug for XdndSession {
 }
 
 impl XdndSession {
+    const STATUS_TIMEOUT: Duration = Duration::from_secs(2);
+    const FINISHED_TIMEOUT: Duration = Duration::from_secs(20);
+
     fn start<C: Connection>(
         conn: &C,
-        source_window: XWindow,
+        editor_window: XWindow,
         files: FileSet,
         reporter: SessionReporter,
         press: X11PointerEvent,
     ) -> Result<Self, X11StartError> {
         let (paths, preview) = files.into_parts();
         let atoms = XdndAtoms::new(conn)?;
+        let source_window = create_source_window(conn, press.root)?;
         conn.set_selection_owner(source_window, atoms.xdnd_selection, press.time)
-            .map_err(x11_error)?;
+            .map_err(|error| {
+                let _ = conn.destroy_window(source_window);
+                let _ = conn.flush();
+                x11_error(error)
+            })?;
         let owner = match conn
             .get_selection_owner(atoms.xdnd_selection)
             .map_err(x11_error)
@@ -692,16 +647,18 @@ impl XdndSession {
         {
             Ok(reply) => reply.owner,
             Err(error) => {
-                let _ = conn.set_selection_owner(x11rb::NONE, atoms.xdnd_selection, press.time);
+                let _ = conn.destroy_window(source_window);
                 let _ = conn.flush();
                 return Err(error);
             }
         };
         if owner != source_window {
+            let _ = conn.destroy_window(source_window);
+            let _ = conn.flush();
             return Err(X11SessionError::new("could not own XdndSelection"));
         }
-        if let Err(error) = capture_pointer(conn, source_window, press.time) {
-            let _ = conn.set_selection_owner(x11rb::NONE, atoms.xdnd_selection, press.time);
+        if let Err(error) = capture_pointer(conn, editor_window, press.time) {
+            let _ = conn.destroy_window(source_window);
             let _ = conn.flush();
             return Err(error);
         }
@@ -725,9 +682,20 @@ impl XdndSession {
             atoms,
             root: press.root,
             source_window,
+            editor_window,
+            source_windows: vec![source_window],
+            source_guards: vec![OutboundGuard::register(Some(source_window))],
+            source_used: false,
+            selection_time: press.time,
             file_payload: FileDragPayloadData::from_validated(paths),
             current_target: None,
             target_acceptance: TargetAcceptance::Unknown,
+            awaiting_status: false,
+            last_position: None,
+            queued_position: None,
+            status_deadline: None,
+            finished_deadline: None,
+            position_deadline: None,
             released_target: None,
             drop_target: None,
             payload_target: None,
@@ -743,7 +711,7 @@ impl XdndSession {
             if let Some(preview) = session.preview.take() {
                 preview.destroy(conn);
             }
-            let _ = conn.set_selection_owner(x11rb::NONE, session.atoms.xdnd_selection, press.time);
+            session.destroy_source_windows(conn);
             let _ = conn.flush();
             return Err(error);
         }
@@ -752,7 +720,7 @@ impl XdndSession {
             if let Some(preview) = session.preview.take() {
                 preview.destroy(conn);
             }
-            let _ = conn.set_selection_owner(x11rb::NONE, session.atoms.xdnd_selection, press.time);
+            session.destroy_source_windows(conn);
             let _ = conn.flush();
             return Err(error);
         }
@@ -769,19 +737,19 @@ impl XdndSession {
             return Ok(X11SessionStatus::Finished);
         }
 
+        if self.poll_at(conn, Instant::now())? == X11SessionStatus::Finished {
+            return Ok(X11SessionStatus::Finished);
+        }
+
         if let Err(error) = self.drive_event(conn, event) {
             self.release_pointer(conn);
             if let Some(preview) = self.preview.take() {
                 preview.destroy(conn);
             }
             let _ = self.leave_current_target(conn);
-            let _ = conn.set_selection_owner(
-                x11rb::NONE,
-                self.atoms.xdnd_selection,
-                self.last_event_time,
-            );
             let _ = conn.flush();
             self.finished = true;
+            self.destroy_source_windows(conn);
             self.reporter
                 .finish_linux(LinuxOutcome::Failed(crate::LinuxFailure::Setup));
             return Err(error);
@@ -840,7 +808,10 @@ impl XdndSession {
             {
                 self.redraw_preview(conn);
             }
-            Event::SelectionClear(event) if event.selection == self.atoms.xdnd_selection => {
+            Event::SelectionClear(event)
+                if event.selection == self.atoms.xdnd_selection
+                    && event.owner == self.source_window =>
+            {
                 self.finish(conn, LinuxOutcome::Cancelled)?;
             }
             _ => {}
@@ -848,15 +819,92 @@ impl XdndSession {
         Ok(())
     }
 
+    fn poll_at<C: Connection>(
+        &mut self,
+        conn: &C,
+        now: Instant,
+    ) -> Result<X11SessionStatus, X11SessionError> {
+        if !self.finished {
+            if self
+                .finished_deadline
+                .is_some_and(|deadline| now >= deadline)
+            {
+                // A sent Drop can have taken effect even without Finished.
+                self.finish(conn, LinuxOutcome::Indeterminate)?;
+            } else if self.status_deadline.is_some_and(|deadline| now >= deadline) {
+                let leave = self.leave_current_target(conn);
+                let finish = self.finish(conn, LinuxOutcome::Cancelled);
+                leave.and(finish)?;
+            } else if self.released_target.is_none()
+                && !self.awaiting_status
+                && self
+                    .position_deadline
+                    .is_some_and(|deadline| now >= deadline)
+                && let (Some(target), Some((x, y))) = (self.current_target, self.last_position)
+            {
+                // Targets use periodic positions for stationary scroll zones.
+                self.last_position = None;
+                self.send_position(conn, target, x, y, self.last_event_time)?;
+            }
+        }
+        Ok(if self.finished {
+            X11SessionStatus::Finished
+        } else {
+            X11SessionStatus::Active
+        })
+    }
+
+    fn destroy_source_windows<C: Connection>(&mut self, conn: &C) {
+        // DestroyWindow clears selection ownership atomically only when this
+        // window is still the owner. A GetOwner/SetOwner(None) pair can clear
+        // another client's selection if it takes ownership between requests.
+        for window in self.source_windows.drain(..) {
+            let _ = conn.destroy_window(window);
+        }
+        self.source_guards.clear();
+        let _ = conn.flush();
+    }
+
+    fn rotate_source<C: Connection>(&mut self, conn: &C) -> Result<(), X11SessionError> {
+        if !self.source_used {
+            return Ok(());
+        }
+        let source = create_source_window(conn, self.root)?;
+        self.source_windows.push(source);
+        self.source_guards
+            .push(OutboundGuard::register(Some(source)));
+        conn.set_selection_owner(source, self.atoms.xdnd_selection, self.last_event_time)
+            .map_err(x11_error)?;
+        let owner = conn
+            .get_selection_owner(self.atoms.xdnd_selection)
+            .map_err(x11_error)?
+            .reply()
+            .map_err(x11_error)?
+            .owner;
+        if owner != source {
+            return Err(X11SessionError::new(
+                "could not rotate the XDND source epoch",
+            ));
+        }
+        self.source_window = source;
+        self.selection_time = self.last_event_time;
+        self.source_used = false;
+        Ok(())
+    }
+
     /// Cancel from an authoritative toolkit teardown or gesture-cancel event.
     pub fn cancel<C: Connection>(mut self, conn: &C) -> Result<(), X11SessionError> {
         if !self.finished {
+            if self.drop_target.is_some() {
+                return self.finish(conn, LinuxOutcome::Indeterminate);
+            }
             self.release_pointer(conn);
             if let Some(preview) = self.preview.take() {
                 preview.destroy(conn);
             }
-            self.leave_current_target(conn)?;
-            self.finish(conn, LinuxOutcome::Cancelled)?;
+            let leave = self.leave_current_target(conn);
+            let finish = self.finish(conn, LinuxOutcome::Cancelled);
+            leave.and(finish)?;
         }
         Ok(())
     }
@@ -867,15 +915,7 @@ impl XdndSession {
     /// `XdndLeave`. The target action remains unconfirmed.
     pub fn supersede<C: Connection>(mut self, conn: &C) -> Result<(), X11SessionError> {
         if !self.finished {
-            self.release_pointer(conn);
-            if let Some(preview) = self.preview.take() {
-                preview.destroy(conn);
-            }
-            conn.set_selection_owner(x11rb::NONE, self.atoms.xdnd_selection, self.last_event_time)
-                .map_err(x11_error)?;
-            conn.flush().map_err(x11_error)?;
-            self.finished = true;
-            self.reporter.finish_linux(LinuxOutcome::Indeterminate);
+            self.finish(conn, LinuxOutcome::Indeterminate)?;
         }
         Ok(())
     }
@@ -927,16 +967,18 @@ impl XdndSession {
         root_x: i16,
         root_y: i16,
     ) -> Result<(), X11SessionError> {
-        let target = self.find_xdnd_target(conn)?;
+        let target = self.find_xdnd_target(conn, root_x, root_y)?;
         if target != self.current_target {
             self.leave_current_target(conn)?;
             self.current_target = target;
             if let Some(target) = target {
+                self.rotate_source(conn)?;
                 self.send_enter(conn, target)?;
+                self.source_used = true;
             }
         }
         if let Some(target) = self.current_target {
-            self.send_position(conn, target, root_x, root_y)?;
+            self.send_position(conn, target, root_x, root_y, self.last_event_time)?;
         }
         Ok(())
     }
@@ -951,15 +993,7 @@ impl XdndSession {
         if let Some(preview) = self.preview.take() {
             preview.destroy(conn);
         }
-        let target = self.find_xdnd_target(conn)?;
-        if target != self.current_target {
-            self.leave_current_target(conn)?;
-            self.current_target = target;
-            if let Some(target) = target {
-                self.send_enter(conn, target)?;
-                self.send_position(conn, target, event.root_x, event.root_y)?;
-            }
-        }
+        self.update_target(conn, event.root_x, event.root_y)?;
         let Some(target) = self.current_target else {
             return self.finish(conn, LinuxOutcome::Cancelled);
         };
@@ -973,6 +1007,7 @@ impl XdndSession {
         target: XdndTarget,
     ) -> Result<(), X11SessionError> {
         self.drop_target = Some(target);
+        self.finished_deadline = Some(Instant::now() + Self::FINISHED_TIMEOUT);
         self.send_client_message(
             conn,
             target,
@@ -991,20 +1026,34 @@ impl XdndSession {
         conn: &C,
         event: &ClientMessageEvent,
     ) -> Result<(), X11SessionError> {
+        if event.format != 32 || event.window != self.source_window {
+            return Ok(());
+        }
         let data = event.data.as_data32();
         let target = data[0];
-        if self
-            .current_target
-            .is_none_or(|current| current.logical != target)
+        if !self.awaiting_status
+            || self
+                .current_target
+                .is_none_or(|current| current.logical != target)
         {
             return Ok(());
         }
-        let accepted = data[1] & STATUS_ACCEPT == STATUS_ACCEPT;
+        self.awaiting_status = false;
+        self.status_deadline = None;
+        let rectangle = data[3];
+        self.position_deadline = (self.released_target.is_none()
+            && (data[1] & 2 != 0 || rectangle >> 16 == 0 || rectangle & 0xffff == 0))
+            .then(|| Instant::now() + Duration::from_millis(100));
+        let accepted =
+            data[1] & STATUS_ACCEPT == STATUS_ACCEPT && data[4] == self.atoms.xdnd_action_copy;
         self.target_acceptance = if accepted {
             TargetAcceptance::Accepted(target)
         } else {
             TargetAcceptance::Rejected(target)
         };
+        if let Some((x, y, time)) = self.queued_position.take() {
+            self.send_position(conn, self.current_target.unwrap(), x, y, time)?;
+        }
         self.maybe_complete_release(conn)
     }
 
@@ -1013,18 +1062,20 @@ impl XdndSession {
         conn: &C,
         event: &ClientMessageEvent,
     ) -> Result<(), X11SessionError> {
-        let data = event.data.as_data32();
-        if self
-            .drop_target
-            .is_none_or(|target| target.logical != data[0])
-        {
+        if event.format != 32 || event.window != self.source_window {
             return Ok(());
         }
-        let outcome = if data[1] & 1 == 1 && data[2] == self.atoms.xdnd_action_copy {
-            LinuxOutcome::Exported
-        } else {
-            LinuxOutcome::Rejected(LinuxRejector::Target)
+        let data = event.data.as_data32();
+        let Some(target) = self.drop_target.filter(|target| target.logical == data[0]) else {
+            return Ok(());
         };
+        // XDND 3/4 have no success bit or performed-action field.
+        let outcome =
+            if target.version < 5 || (data[1] & 1 == 1 && data[2] == self.atoms.xdnd_action_copy) {
+                LinuxOutcome::Exported
+            } else {
+                LinuxOutcome::Rejected(LinuxRejector::Target)
+            };
         self.finish(conn, outcome)
     }
 
@@ -1034,6 +1085,11 @@ impl XdndSession {
         event: &SelectionRequestEvent,
     ) -> Result<(), X11SessionError> {
         if event.selection != self.atoms.xdnd_selection || event.owner != self.source_window {
+            return Ok(());
+        }
+        if event.time != CURRENT_TIME && (event.time.wrapping_sub(self.selection_time) as i32) < 0 {
+            self.send_selection_notify(conn, event, AtomEnum::NONE.into())?;
+            conn.flush().map_err(x11_error)?;
             return Ok(());
         }
         let property = if event.property == AtomEnum::NONE.into() {
@@ -1094,7 +1150,7 @@ impl XdndSession {
         let Some(target) = self.released_target else {
             return Ok(());
         };
-        if self.drop_target.is_some() {
+        if self.drop_target.is_some() || self.awaiting_status {
             return Ok(());
         }
         match self.target_acceptance {
@@ -1134,11 +1190,15 @@ impl XdndSession {
     fn find_xdnd_target<C: Connection>(
         &self,
         conn: &C,
+        root_x: i16,
+        root_y: i16,
     ) -> Result<Option<XdndTarget>, X11SessionError> {
         let mut candidate = self.root;
         loop {
+            // The server's live pointer can have moved since this queued
+            // event, especially once release ends the grab. Use its snapshot.
             let pointer = conn
-                .query_pointer(candidate)
+                .translate_coordinates(self.root, candidate, root_x, root_y)
                 .map_err(x11_error)?
                 .reply()
                 .map_err(x11_error)?;
@@ -1146,18 +1206,18 @@ impl XdndSession {
                 break;
             }
             candidate = pointer.child;
-            if candidate == self.source_window {
+            if candidate == self.editor_window || self.source_windows.contains(&candidate) {
                 return Ok(None);
             }
         }
 
         let mut window = (candidate != self.root).then_some(candidate);
         while let Some(candidate) = window {
-            if candidate == self.source_window {
+            if candidate == self.editor_window || self.source_windows.contains(&candidate) {
                 return Ok(None);
             }
-            if self.is_xdnd_aware(conn, candidate)? {
-                return self.target(conn, candidate).map(Some);
+            if let Some(target) = self.target(conn, candidate)? {
+                return Ok(Some(target));
             }
             window = self.parent_of(conn, candidate)?;
         }
@@ -1177,29 +1237,45 @@ impl XdndSession {
         Ok((tree.parent != x11rb::NONE).then_some(tree.parent))
     }
 
-    fn is_xdnd_aware<C: Connection>(
+    fn xdnd_version<C: Connection>(
         &self,
         conn: &C,
         window: XWindow,
-    ) -> Result<bool, X11SessionError> {
-        let property = conn
-            .get_property(false, window, self.atoms.xdnd_aware, AtomEnum::ANY, 0, 1)
+    ) -> Result<Option<u32>, X11SessionError> {
+        let property = match conn
+            .get_property(false, window, self.atoms.xdnd_aware, AtomEnum::ATOM, 0, 1)
             .map_err(x11_error)?
             .reply()
-            .map_err(x11_error)?;
-        Ok(property.value_len > 0)
+        {
+            Ok(property) => property,
+            Err(ReplyError::X11Error(error)) if error.error_kind == ErrorKind::Window => {
+                return Ok(None);
+            }
+            Err(error) => return Err(x11_error(error)),
+        };
+        Ok(property
+            .value32()
+            .and_then(|mut values| values.next())
+            .filter(|version| *version >= 3)
+            .map(|version| version.min(XDND_VERSION)))
     }
 
     fn target<C: Connection>(
         &self,
         conn: &C,
         logical: XWindow,
-    ) -> Result<XdndTarget, X11SessionError> {
+    ) -> Result<Option<XdndTarget>, X11SessionError> {
         let recipient = match self.xdnd_proxy(conn, logical)? {
             Some(proxy) if self.xdnd_proxy(conn, proxy)? == Some(proxy) => proxy,
             _ => logical,
         };
-        Ok(XdndTarget { logical, recipient })
+        Ok(self
+            .xdnd_version(conn, recipient)?
+            .map(|version| XdndTarget {
+                logical,
+                recipient,
+                version,
+            }))
     }
 
     fn xdnd_proxy<C: Connection>(
@@ -1207,11 +1283,21 @@ impl XdndSession {
         conn: &C,
         window: XWindow,
     ) -> Result<Option<XWindow>, X11SessionError> {
-        let property = conn
+        let property = match conn
             .get_property(false, window, self.atoms.xdnd_proxy, AtomEnum::WINDOW, 0, 1)
             .map_err(x11_error)?
             .reply()
-            .map_err(x11_error)?;
+        {
+            Ok(property) => property,
+            // A stale proxy left behind after its owner crashes must be ignored.
+            Err(ReplyError::X11Error(error)) if error.error_kind == ErrorKind::Window => {
+                return Ok(None);
+            }
+            Err(error) => return Err(x11_error(error)),
+        };
+        if property.value_len != 1 || property.bytes_after != 0 {
+            return Ok(None);
+        }
         Ok(property.value32().and_then(|mut values| values.next()))
     }
 
@@ -1236,7 +1322,7 @@ impl XdndSession {
             self.atoms.xdnd_enter,
             [
                 self.source_window,
-                (XDND_VERSION << 24) | 1,
+                (target.version << 24) | 1,
                 enter[0],
                 enter[1],
                 enter[2],
@@ -1250,20 +1336,30 @@ impl XdndSession {
         target: XdndTarget,
         root_x: i16,
         root_y: i16,
+        time: u32,
     ) -> Result<(), X11SessionError> {
+        if self.awaiting_status {
+            self.queued_position =
+                (self.last_position != Some((root_x, root_y))).then_some((root_x, root_y, time));
+            return Ok(());
+        }
+        if self.last_position == Some((root_x, root_y)) {
+            return Ok(());
+        }
         let xy = ((root_x as u32) << 16) | u32::from(root_y as u16);
         self.send_client_message(
             conn,
             target,
             self.atoms.xdnd_position,
-            [
-                self.source_window,
-                0,
-                xy,
-                self.last_event_time,
-                self.atoms.xdnd_action_copy,
-            ],
-        )
+            [self.source_window, 0, xy, time, self.atoms.xdnd_action_copy],
+        )?;
+        // Status has no sequence number: keep only one position in flight.
+        self.awaiting_status = true;
+        self.position_deadline = None;
+        self.status_deadline = Some(Instant::now() + Self::STATUS_TIMEOUT);
+        self.last_position = Some((root_x, root_y));
+        self.target_acceptance = TargetAcceptance::Unknown;
+        Ok(())
     }
 
     fn leave_current_target<C: Connection>(&mut self, conn: &C) -> Result<(), X11SessionError> {
@@ -1276,6 +1372,11 @@ impl XdndSession {
             )?;
         }
         self.target_acceptance = TargetAcceptance::Unknown;
+        self.awaiting_status = false;
+        self.status_deadline = None;
+        self.position_deadline = None;
+        self.last_position = None;
+        self.queued_position = None;
         self.payload_target = None;
         Ok(())
     }
@@ -1318,13 +1419,35 @@ impl XdndSession {
         if let Some(preview) = self.preview.take() {
             preview.destroy(conn);
         }
-        conn.set_selection_owner(x11rb::NONE, self.atoms.xdnd_selection, self.last_event_time)
-            .map_err(x11_error)?;
-        conn.flush().map_err(x11_error)?;
         self.finished = true;
+        self.destroy_source_windows(conn);
         self.reporter.finish_linux(outcome);
-        Ok(())
+        conn.flush().map_err(x11_error)
     }
+}
+
+fn create_source_window<C: Connection>(
+    conn: &C,
+    root: XWindow,
+) -> Result<XWindow, X11SessionError> {
+    let source = conn.generate_id().map_err(x11_error)?;
+    conn.create_window(
+        0,
+        source,
+        root,
+        0,
+        0,
+        1,
+        1,
+        0,
+        WindowClass::INPUT_ONLY,
+        0,
+        &CreateWindowAux::new(),
+    )
+    .map_err(x11_error)?
+    .check()
+    .map_err(x11_error)?;
+    Ok(source)
 }
 
 impl Drop for XdndSession {
