@@ -637,6 +637,7 @@ impl XdndSession {
         conn.set_selection_owner(source_window, atoms.xdnd_selection, press.time)
             .map_err(|error| {
                 let _ = conn.destroy_window(source_window);
+                let _ = conn.flush();
                 x11_error(error)
             })?;
         let owner = match conn
@@ -646,7 +647,6 @@ impl XdndSession {
         {
             Ok(reply) => reply.owner,
             Err(error) => {
-                let _ = conn.set_selection_owner(x11rb::NONE, atoms.xdnd_selection, press.time);
                 let _ = conn.destroy_window(source_window);
                 let _ = conn.flush();
                 return Err(error);
@@ -654,10 +654,10 @@ impl XdndSession {
         };
         if owner != source_window {
             let _ = conn.destroy_window(source_window);
+            let _ = conn.flush();
             return Err(X11SessionError::new("could not own XdndSelection"));
         }
         if let Err(error) = capture_pointer(conn, editor_window, press.time) {
-            let _ = conn.set_selection_owner(x11rb::NONE, atoms.xdnd_selection, press.time);
             let _ = conn.destroy_window(source_window);
             let _ = conn.flush();
             return Err(error);
@@ -711,7 +711,6 @@ impl XdndSession {
             if let Some(preview) = session.preview.take() {
                 preview.destroy(conn);
             }
-            let _ = session.release_selection(conn);
             session.destroy_source_windows(conn);
             let _ = conn.flush();
             return Err(error);
@@ -721,7 +720,6 @@ impl XdndSession {
             if let Some(preview) = session.preview.take() {
                 preview.destroy(conn);
             }
-            let _ = session.release_selection(conn);
             session.destroy_source_windows(conn);
             let _ = conn.flush();
             return Err(error);
@@ -749,7 +747,6 @@ impl XdndSession {
                 preview.destroy(conn);
             }
             let _ = self.leave_current_target(conn);
-            let _ = self.release_selection(conn);
             let _ = conn.flush();
             self.finished = true;
             self.destroy_source_windows(conn);
@@ -858,25 +855,14 @@ impl XdndSession {
     }
 
     fn destroy_source_windows<C: Connection>(&mut self, conn: &C) {
+        // DestroyWindow clears selection ownership atomically only when this
+        // window is still the owner. A GetOwner/SetOwner(None) pair can clear
+        // another client's selection if it takes ownership between requests.
         for window in self.source_windows.drain(..) {
             let _ = conn.destroy_window(window);
         }
         self.source_guards.clear();
         let _ = conn.flush();
-    }
-
-    fn release_selection<C: Connection>(&self, conn: &C) -> Result<(), X11SessionError> {
-        let owner = conn
-            .get_selection_owner(self.atoms.xdnd_selection)
-            .map_err(x11_error)?
-            .reply()
-            .map_err(x11_error)?
-            .owner;
-        if self.source_windows.contains(&owner) {
-            conn.set_selection_owner(x11rb::NONE, self.atoms.xdnd_selection, CURRENT_TIME)
-                .map_err(x11_error)?;
-        }
-        Ok(())
     }
 
     fn rotate_source<C: Connection>(&mut self, conn: &C) -> Result<(), X11SessionError> {
@@ -1433,11 +1419,10 @@ impl XdndSession {
         if let Some(preview) = self.preview.take() {
             preview.destroy(conn);
         }
-        let selection = self.release_selection(conn);
         self.finished = true;
         self.destroy_source_windows(conn);
         self.reporter.finish_linux(outcome);
-        selection.and(conn.flush().map_err(x11_error))
+        conn.flush().map_err(x11_error)
     }
 }
 

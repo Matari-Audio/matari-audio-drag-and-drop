@@ -1,5 +1,8 @@
 #![cfg(target_os = "linux")]
 
+#[path = "support/selection_race.rs"]
+mod selection_race;
+
 use matari_audio_drag_and_drop::*;
 use raw_window_handle::{DisplayHandle, HasDisplayHandle, HasWindowHandle, WindowHandle};
 use std::time::{Duration, Instant};
@@ -1315,4 +1318,119 @@ fn teardown_after_drop_does_not_send_leave_or_claim_cancellation() {
             .owner,
         x11rb::NONE
     );
+}
+
+#[test]
+#[ignore = "requires an isolated X11 display"]
+fn terminal_cleanup_cannot_clear_a_peer_claim_at_the_ownership_boundary() {
+    // Exercise actual session teardown through a real X11 connection. The
+    // interposer lets a second client take ownership after an old GetOwner
+    // reply, or immediately before DestroyWindow when there is no owner query.
+    for mode in 0..4 {
+        let mut drag = Drag::new(5);
+        let copy = drag.atom(b"XdndActionCopy");
+        if mode >= 2 {
+            drag.status(32, drag.source, copy);
+            drag.release();
+        } else if mode == 1 {
+            drag.release();
+        }
+        let (peer, _) = x11rb::connect(None).unwrap();
+        let peer_window = peer.generate_id().unwrap();
+        peer.create_window(
+            0,
+            peer_window,
+            drag.root,
+            0,
+            0,
+            1,
+            1,
+            0,
+            WindowClass::INPUT_ONLY,
+            0,
+            &CreateWindowAux::new(),
+        )
+        .unwrap()
+        .check()
+        .unwrap();
+        let selection = drag.atom(b"XdndSelection");
+        let race = selection_race::SelectionRace::new(
+            &drag.conn,
+            &peer,
+            drag.source,
+            peer_window,
+            selection,
+        );
+        let expected = match mode {
+            0 => {
+                drag.session.take().unwrap().cancel(&race).unwrap();
+                LinuxOutcome::Cancelled
+            }
+            1 => {
+                assert_eq!(
+                    drag.session
+                        .as_mut()
+                        .unwrap()
+                        .poll_at(&race, Instant::now() + Duration::from_secs(3))
+                        .unwrap(),
+                    X11SessionStatus::Finished
+                );
+                LinuxOutcome::Cancelled
+            }
+            2 => {
+                let finished = ClientMessageEvent::new(
+                    32,
+                    drag.source,
+                    drag.atom(b"XdndFinished"),
+                    [drag.target, 1, copy, 0, 0],
+                );
+                assert_eq!(
+                    drag.session
+                        .as_mut()
+                        .unwrap()
+                        .handle_event(&race, &Event::ClientMessage(finished))
+                        .unwrap(),
+                    X11SessionStatus::Finished
+                );
+                LinuxOutcome::Exported
+            }
+            3 => {
+                assert_eq!(
+                    drag.session
+                        .as_mut()
+                        .unwrap()
+                        .poll_at(&race, Instant::now() + Duration::from_secs(21))
+                        .unwrap(),
+                    X11SessionStatus::Finished
+                );
+                LinuxOutcome::Indeterminate
+            }
+            _ => unreachable!(),
+        };
+        assert!(
+            race.took_over(),
+            "the peer actually raced cleanup, mode {mode}"
+        );
+        assert_eq!(
+            peer.get_selection_owner(selection)
+                .unwrap()
+                .reply()
+                .unwrap()
+                .owner,
+            peer_window,
+            "cleanup erased the peer's selection, mode {mode}"
+        );
+        assert!(
+            !race.sent_explicit_clear.get(),
+            "cleanup sent a non-atomic clear, mode {mode}"
+        );
+        assert!(
+            drag.conn
+                .get_geometry(drag.source)
+                .unwrap()
+                .reply()
+                .is_err()
+        );
+        assert_eq!(drag.terminal_outcome(), expected);
+    }
 }
