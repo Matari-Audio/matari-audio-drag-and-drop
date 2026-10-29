@@ -68,6 +68,19 @@ impl WaylandSourceReporter {
         self.reporter.finish_linux(outcome);
     }
 
+    /// Finish a source whose native grab ended without a terminal event.
+    ///
+    /// Call only after native evidence that the compositor released the drag,
+    /// such as a new pointer press on the origin surface. A performed drop
+    /// that never finished is indeterminate; otherwise the drag was cancelled.
+    pub fn retire(&self) {
+        self.finish_linux(if self.drop_performed {
+            LinuxOutcome::Indeterminate
+        } else {
+            LinuxOutcome::Cancelled
+        });
+    }
+
     /// Finish the source from an authoritative native terminal event.
     pub fn finish(&self, outcome: Outcome) {
         self.reporter.finish(outcome);

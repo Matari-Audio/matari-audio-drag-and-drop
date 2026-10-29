@@ -777,33 +777,31 @@ struct DragIcon {
     surface: WlSurface,
     _pool: SlotPool,
     _buffer: Buffer,
-    dimensions: [i32; 2],
-    logical_dimensions: [i32; 2],
-    offset: [i32; 2],
-    scale: i32,
+    icon: crate::WaylandIcon,
 }
 
 impl DragIcon {
     fn show(&self) {
+        let icon = &self.icon;
         if self.surface.version() >= 3 {
-            self.surface.set_buffer_scale(self.scale);
+            self.surface.set_buffer_scale(icon.scale);
         }
         if self.surface.version() >= 5 {
             self.surface.attach(Some(self._buffer.wl_buffer()), 0, 0);
-            self.surface.offset(self.offset[0], self.offset[1]);
+            self.surface.offset(icon.offset[0], icon.offset[1]);
         } else {
             self.surface.attach(
                 Some(self._buffer.wl_buffer()),
-                self.offset[0],
-                self.offset[1],
+                icon.offset[0],
+                icon.offset[1],
             );
         }
         if self.surface.version() >= 4 {
             self.surface
-                .damage_buffer(0, 0, self.dimensions[0], self.dimensions[1]);
+                .damage_buffer(0, 0, icon.buffer_size[0], icon.buffer_size[1]);
         } else {
             self.surface
-                .damage(0, 0, self.logical_dimensions[0], self.logical_dimensions[1]);
+                .damage(0, 0, icon.logical_size[0], icon.logical_size[1]);
         }
         self.surface.commit();
     }
@@ -822,30 +820,17 @@ impl DragIcon {
         } else {
             1
         };
-        let image = crate::preview::render_scaled(preview, scale as f32)
+        let icon = preview
+            .wayland_icon(scale)
             .map_err(|error| WaylandBridgeError::new(error.to_string()))?;
-        let width = aligned_icon_extent(image.width, scale)?;
-        let height = aligned_icon_extent(image.height, scale)?;
-        let stride = width
-            .checked_mul(4)
-            .ok_or_else(|| WaylandBridgeError::new("drag icon stride overflow"))?;
-        let bytes = (stride as usize)
-            .checked_mul(height as usize)
-            .ok_or_else(|| WaylandBridgeError::new("drag icon buffer overflow"))?;
-        let mut pool = SlotPool::new(bytes, shm)
+        let [width, height] = icon.buffer_size;
+        let stride = width * 4;
+        let mut pool = SlotPool::new(icon.pixels.len(), shm)
             .map_err(|error| WaylandBridgeError::new(format!("drag icon pool failed: {error}")))?;
         let (buffer, canvas) = pool
             .create_buffer(width, height, stride, wl_shm::Format::Argb8888)
             .map_err(|error| WaylandBridgeError::new(format!("drag icon failed: {error}")))?;
-        // Integer buffer scale requires divisible backing dimensions. Pad
-        // fractional logical extents with transparent pixels rather than
-        // stretching the caller's image or triggering wl_surface.invalid_size.
-        canvas.fill(0);
-        for (row, source) in image.pixels.chunks_exact(image.width * 4).enumerate() {
-            let start = row * stride as usize;
-            canvas[start..start + source.len()].copy_from_slice(source);
-        }
-        let hotspot = preview.hotspot();
+        canvas.copy_from_slice(&icon.pixels);
         // No global pointer position is needed: the compositor places this
         // surface relative to the drag hotspot. Commit after start_drag assigns
         // the icon role, never before it.
@@ -853,26 +838,9 @@ impl DragIcon {
             surface: compositor.create_surface(queue, ()),
             _pool: pool,
             _buffer: buffer,
-            dimensions: [width, height],
-            logical_dimensions: [width / scale, height / scale],
-            offset: [-(hotspot[0].round() as i32), -(hotspot[1].round() as i32)],
-            scale,
+            icon,
         })
     }
-}
-
-fn aligned_icon_extent(size: usize, scale: i32) -> Result<i32, WaylandBridgeError> {
-    let scale = usize::try_from(scale)
-        .ok()
-        .filter(|scale| *scale > 0)
-        .ok_or_else(|| WaylandBridgeError::new("drag icon scale is invalid"))?;
-    let aligned = size
-        .checked_add(scale - 1)
-        .map(|size| size / scale * scale)
-        .filter(|size| *size > 0)
-        .and_then(|size| i32::try_from(size).ok())
-        .ok_or_else(|| WaylandBridgeError::new("drag icon dimensions overflow"))?;
-    Ok(aligned)
 }
 
 impl Drop for DragIcon {
@@ -1178,16 +1146,6 @@ mod tests {
                 Err(error) => panic!("pipe read failed: {error}"),
             }
         }
-    }
-
-    #[test]
-    fn fractional_logical_extents_align_to_integer_buffer_scale() {
-        assert_eq!(aligned_icon_extent(65, 2).unwrap(), 66);
-        assert_eq!(aligned_icon_extent(64, 2).unwrap(), 64);
-        assert_eq!(aligned_icon_extent(1, 3).unwrap(), 3);
-        assert!(aligned_icon_extent(0, 2).is_err());
-        assert!(aligned_icon_extent(10, 0).is_err());
-        assert!(aligned_icon_extent(usize::MAX, 2).is_err());
     }
 
     #[test]

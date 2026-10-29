@@ -2,6 +2,8 @@
 
 ## 0.1.6 - Unreleased
 
+- Place built-in drag thumbnails off the cursor tip on every native backend instead of centering them under the pointer, and expose `DragPreview::wayland_icon` for toolkit-owned Wayland drag icons.
+- Add `WaylandSourceReporter::retire` so a toolkit can finish a Wayland source whose grab ended without a terminal event, reporting an unconfirmed drop as indeterminate.
 - Add validated bitmap previews with separate backing dimensions, logical size, and cursor hotspot.
 - Isolate XDND target visits with fresh source identities, expire unanswered status/drop exchanges, and preserve release-coordinate snapshots.
 - Render X11 previews using verified native pixel layouts, compositor-aware alpha, and input-transparent shaped fallbacks.
