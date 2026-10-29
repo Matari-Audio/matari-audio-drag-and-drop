@@ -36,6 +36,11 @@ impl std::fmt::Display for PreviewImageError {
 
 impl std::error::Error for PreviewImageError {}
 
+/// Hotspot of built-in previews: the image's top-left corner sits 20 points
+/// right of and 22 points below the cursor tip, so the pointer stays visible.
+/// Every native backend places the image from this one value.
+const CURSOR_HOTSPOT: [f64; 2] = [-20.0, -22.0];
+
 /// Owned top-down, tightly packed premultiplied BGRA8 bitmap in sRGB.
 ///
 /// Bitmap dimensions describe backing pixels. Logical size and the cursor
@@ -51,7 +56,7 @@ pub struct DragImage {
 
 impl DragImage {
     /// Validate a bitmap, initially at one backing pixel per logical point.
-    /// The initial hotspot is the image center.
+    /// The initial hotspot keeps the cursor tip visible beside the image.
     ///
     /// # Errors
     /// Returns an error for zero/oversized dimensions, mismatched byte length,
@@ -63,7 +68,7 @@ impl DragImage {
             height,
             pixels,
             logical_size: [width as f64, height as f64],
-            hotspot: [width as f64 * 0.5, height as f64 * 0.5],
+            hotspot: CURSOR_HOTSPOT,
         })
     }
 
@@ -209,8 +214,38 @@ impl DragPreview {
     pub fn hotspot(&self) -> [f64; 2] {
         match self {
             Self::Bitmap(image) => image.hotspot(),
-            _ => [WIDTH as f64 * 0.5, HEIGHT as f64 * 0.5],
+            _ => CURSOR_HOTSPOT,
         }
+    }
+
+    /// Render the native Wayland drag icon at an integer buffer `scale`.
+    ///
+    /// Buffer dimensions are multiples of `scale`; fractional extents are
+    /// padded with transparent pixels rather than stretched.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid preview or a non-positive `scale`.
+    pub fn wayland_icon(&self, scale: i32) -> Result<WaylandIcon, PreviewImageError> {
+        let factor = usize::try_from(scale)
+            .ok()
+            .filter(|scale| *scale > 0)
+            .ok_or(PreviewImageError::Geometry)?;
+        let image = render_scaled(self, scale as f32)?;
+        let width = image.width.div_ceil(factor) * factor;
+        let height = image.height.div_ceil(factor) * factor;
+        let mut pixels = vec![0_u8; pixel_bytes(width, height)?];
+        for (row, source) in image.pixels.chunks_exact(image.width * 4).enumerate() {
+            let start = row * width * 4;
+            pixels[start..start + source.len()].copy_from_slice(source);
+        }
+        let hotspot = self.hotspot();
+        Ok(WaylandIcon {
+            buffer_size: [width as i32, height as i32],
+            scale,
+            logical_size: [(width / factor) as i32, (height / factor) as i32],
+            offset: [-(hotspot[0].round() as i32), -(hotspot[1].round() as i32)],
+            pixels,
+        })
     }
 
     /// Backing scale that preserves the caller's bitmap detail.
@@ -222,6 +257,22 @@ impl DragPreview {
             _ => 1.0,
         }
     }
+}
+
+/// Native Wayland drag icon: premultiplied BGRA pixels in `wl_shm` `Argb8888`
+/// layout, plus the placement that keeps the cursor tip visible.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WaylandIcon {
+    /// Buffer size in backing pixels. Both sides are multiples of `scale`.
+    pub buffer_size: [i32; 2],
+    /// Integer buffer scale for `wl_surface.set_buffer_scale`.
+    pub scale: i32,
+    /// Surface size in logical points, for legacy damage on older surfaces.
+    pub logical_size: [i32; 2],
+    /// Surface offset from the pointer hotspot in logical points.
+    pub offset: [i32; 2],
+    /// Pixel rows, `buffer_size[0] * 4` bytes apart.
+    pub pixels: Vec<u8>,
 }
 
 pub(crate) const WIDTH: usize = 224;
@@ -565,6 +616,32 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn built_in_icons_sit_off_the_cursor_tip() {
+        let preview = DragPreview::Waveform {
+            buckets: vec![(-0.5, 0.5); 4],
+        };
+        let icon = preview.wayland_icon(2).unwrap();
+        assert_eq!(icon.buffer_size, [WIDTH as i32 * 2, HEIGHT as i32 * 2]);
+        assert_eq!(icon.logical_size, [WIDTH as i32, HEIGHT as i32]);
+        assert_eq!(icon.pixels.len(), WIDTH * HEIGHT * 4 * 4);
+        // The surface starts right of and below the tip, so the tip stays visible.
+        assert!(icon.offset[0] > 0 && icon.offset[1] > 0);
+        assert!(preview.wayland_icon(0).is_err());
+    }
+
+    #[test]
+    fn fractional_logical_extents_align_to_integer_buffer_scale() {
+        // 65 backing pixels at 32.5 points render 65 px at scale 2; the buffer pads to 66.
+        let image = DragImage::new(65, 2, vec![0; 65 * 2 * 4])
+            .unwrap()
+            .with_geometry([32.5, 1.0], [0.0, 0.0])
+            .unwrap();
+        let icon = DragPreview::Bitmap(image).wayland_icon(2).unwrap();
+        assert_eq!(icon.buffer_size, [66, 2]);
+        assert_eq!(icon.pixels.len(), 66 * 2 * 4);
+    }
 
     #[test]
     fn an_image_is_the_whole_thumbnail() {

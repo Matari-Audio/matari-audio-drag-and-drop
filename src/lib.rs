@@ -12,6 +12,7 @@ pub use file_payload::FileDragOffer;
 pub(crate) use file_payload::FileDragPayloadData;
 pub use preview::{
     DragImage, DragPreview, MidiPreviewNote, PREVIEW_HEIGHT, PREVIEW_WIDTH, PreviewImageError,
+    WaylandIcon,
 };
 pub use wayland::WaylandSourceReporter;
 

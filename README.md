@@ -62,6 +62,12 @@ the displayed size and cursor offset in logical GUI units; backing resolution
 can differ from displayed size. Use `DragPreview::Bitmap(image)` with
 `FileSet::with_preview` to carry that contract through native rendering.
 
+Built-in previews (waveform, spectral, MIDI, and whole-image) place their
+top-left corner 20 points right of and 22 points below the cursor tip, so the
+pointer stays visible on every native backend. `DragPreview::wayland_icon`
+returns the premultiplied `Argb8888` pixels and surface offset for a toolkit that
+attaches the thumbnail to its own `wl_data_device` source.
+
 Windows renders at the preview window's current monitor DPI in physical desktop
 coordinates. AppKit preserves backing pixels while sizing the image in points.
 X11 uses the native visual's channel masks and byte order, with composited ARGB
