@@ -703,6 +703,10 @@ name = "derpcat-access"
 version = "0.1.0"
 
 [[patch.unused]]
+name = "moose-baseview"
+version = "0.4.1-moose.1"
+
+[[patch.unused]]
 name = "mui"
 version = "0.4.2"
 
