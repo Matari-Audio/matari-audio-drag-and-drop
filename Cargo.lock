@@ -751,6 +751,10 @@ name = "moose-derive"
 version = "7.0.0"
 
 [[patch.unused]]
+name = "moose-dsp"
+version = "7.0.0"
+
+[[patch.unused]]
 name = "moose-egui"
 version = "7.0.0"
 
