@@ -113,35 +113,3 @@ features = [
     "NSURL",
     "objc2-core-foundation",
 ]
-
-# BEGIN tools/patches.py --manifests: blaze reads only manifest [patch] tables
-[patch."https://github.com/Matari-Audio/MUI"]
-moose-baseview = { path = "../mui/vendor/moose-baseview" }
-mui = { path = "../mui/crates/mui" }
-mui-baseview = { path = "../mui/crates/mui-baseview" }
-mui-headless = { path = "../mui/crates/mui-headless" }
-mui-native-dialog = { path = "../mui/crates/mui-native-dialog" }
-mui-text = { path = "../mui/crates/mui-text" }
-mui-vello = { path = "../mui/crates/mui-vello" }
-
-[patch."https://github.com/Matari-Audio/Matari-Access"]
-derpcat-access = { path = "../../licensing/matari-access" }
-
-[patch."https://github.com/Matari-Audio/matari-audio-drag-and-drop"]
-matari-audio-drag-and-drop = { path = "." }
-
-[patch."https://github.com/Matari-Audio/moose"]
-moose = { path = "../moose/crates/moose" }
-moose-au = { path = "../moose/crates/moose-au" }
-moose-clap = { path = "../moose/crates/moose-clap" }
-moose-core = { path = "../moose/crates/moose-core" }
-moose-derive = { path = "../moose/crates/moose-derive" }
-moose-dsp = { path = "../moose/crates/moose-dsp" }
-moose-egui = { path = "../moose/crates/moose-egui" }
-moose-font = { path = "../moose/crates/moose-font" }
-moose-params = { path = "../moose/crates/moose-params" }
-moose-standalone = { path = "../moose/crates/moose-standalone" }
-moose-test = { path = "../moose/crates/moose-test" }
-moose-utils = { path = "../moose/crates/moose-utils" }
-moose-vst3 = { path = "../moose/crates/moose-vst3" }
-# END tools/patches.py --manifests
