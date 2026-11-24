@@ -2,7 +2,7 @@
 
 ## Question
 
-Why can a BUFFR editor embedded as an X11/XWayland plug-in window export a file to a native Wayland target on one gesture, then request the payload without completing the next gesture on Hyprland 0.56.1?
+Why can a plug-in editor embedded as an X11/XWayland plug-in window export a file to a native Wayland target on one gesture, then request the payload without completing the next gesture on Hyprland 0.56.1?
 
 ## Verdict
 
@@ -14,7 +14,7 @@ The minimal change is to call `Connection::roundtrip()` after `start_drag` and b
 
 ## Actual stack
 
-The failing path is not BUFFR's standalone/native Wayland path:
+The failing path is not the plug-in's standalone/native Wayland path:
 
 1. A Nice Plug editor is embedded by the host as an X11 window under XWayland.
 2. Baseview captures the X11 pointer gesture and gives Matari X11 pointer authority.
@@ -71,7 +71,7 @@ The bridge also renders and allocates its Wayland drag icon synchronously before
 
 Hyprland 0.56.1's XWayland bridge implements the native-Wayland-source to XWayland-target direction. Its XWM ignores XFixes notifications for the X11 DND selection instead of constructing a native Wayland data source from an X11 drag. [Hyprland XWM selection handling](https://github.com/hyprwm/Hyprland/blob/v0.56.1/src/xwayland/XWM.cpp#L795-L807), [Hyprland PR 8708](https://github.com/hyprwm/Hyprland/pull/8708)
 
-Therefore canonical XDND is appropriate for XWayland destinations but cannot, on this Hyprland version, initiate the reverse XWayland-source to native-Wayland-target route BUFFR needs.
+Therefore canonical XDND is appropriate for XWayland destinations but cannot, on this Hyprland version, initiate the reverse XWayland-source to native-Wayland-target route an embedded XWayland plug-in needs.
 
 ### XDG Desktop Portal FileTransfer
 
@@ -103,4 +103,4 @@ The source inspection proves:
 - the calloop prepared-read lifecycle does not conflict with invoking it from the command callback;
 - XDND and FileTransfer do not provide the required reverse drag-start route.
 
-It does not prove that the user's alternating failure is gone. That requires repeated drags from the installed BUFFR plug-in to both native Wayland and XWayland targets, with logs confirming each drag reaches a terminal exported, cancelled, or failed state rather than stopping after `Target requested file data`.
+It does not prove that the user's alternating failure is gone. That requires repeated drags from the installed plug-in to both native Wayland and XWayland targets, with logs confirming each drag reaches a terminal exported, cancelled, or failed state rather than stopping after `Target requested file data`.
